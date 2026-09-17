@@ -3,9 +3,14 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-install -d "$HOME/bin" "$HOME/.config/systemd/user" "$HOME/.config/roaring-presence"
+install -d "$HOME/bin" "$HOME/.config/systemd/user" "$HOME/.config/roaring-presence" \
+  "$HOME/.local/share/applications"
 install -m 755 "$HERE"/bin/* "$HOME/bin/"
 install -m 644 "$HERE"/systemd/user/* "$HOME/.config/systemd/user/"
+# Desktop entry: gives the MPRIS service a name and icon in the KDE panel.
+install -m 644 "$HERE"/desktop/* "$HOME/.local/share/applications/"
+command -v update-desktop-database >/dev/null &&
+  update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 
 if [ ! -f "$HOME/.config/roaring-presence/config.json" ]; then
   install -m 644 "$HERE/config/config.sample.json" \

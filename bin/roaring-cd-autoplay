@@ -152,6 +152,51 @@ def choose(title: str, prompt: str, items: list):
     return None
 
 
+def player_enabled() -> bool:
+    """cd.player_ui in the config, with an env override for one-off runs."""
+    if os.environ.get("ROARING_CD_NO_PLAYER") == "1":
+        return False
+    try:
+        with open(
+            os.path.expanduser("~/.config/roaring-presence/config.json"),
+            encoding="utf-8",
+        ) as fh:
+            config = json.load(fh)
+    except Exception:
+        return True  # default on; a missing config should not disable controls
+    return bool((config.get("cd") or {}).get("player_ui", True))
+
+
+def launch_player(device: str, payload: dict) -> bool:
+    """Open the control window, which doubles as the insert prompt.
+
+    It also publishes MPRIS, so this is what makes the keyboard media keys
+    work.  Returns False when there is nothing to draw on, so the caller can
+    fall back to the old menu.
+    """
+    if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")):
+        return False
+    binary = shutil.which("roaring-cd-player") or os.path.expanduser(
+        "~/bin/roaring-cd-player"
+    )
+    if not os.access(binary, os.X_OK):
+        return False
+    argv = [binary, "--device", device, "--json", json.dumps(payload)]
+    try:
+        subprocess.Popen(
+            argv,
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        log("control window failed to start: %s" % exc)
+        return False
+    log("control window opened for %s" % device)
+    return True
+
+
 def mpv_argv(device: str, track) -> list:
     socket = os.path.join(runtime_dir(), "mpv-ipc.sock")
     argv = [
@@ -277,6 +322,10 @@ def main(argv: list) -> int:
         return play(device, None)
     if args.track:
         return play(device, args.track)
+
+    # Preferred path: a window that stays open and keeps the media keys bound.
+    if player_enabled() and launch_player(device, dict(payload, device=device)):
+        return 0
 
     items = [("album", "Play full album")]
     if tracks:

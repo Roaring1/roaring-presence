@@ -37,7 +37,10 @@
       "track": "https://music.youtube.com/search?q=%(query)s",
       "album": "https://musicbrainz.org/release/%(release_id)s",
       "album_fallback": "https://music.youtube.com/search?q=%(album_query)s"
-    }
+    },
+    "player_ui": true,
+    "player_poll_seconds": 1,
+    "player_idle_poll_seconds": 3
   },
   "minecraft": {
     "poll_seconds": 10,

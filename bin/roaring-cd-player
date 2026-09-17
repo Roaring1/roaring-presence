@@ -1,0 +1,830 @@
+#!/usr/bin/env python3
+"""roaring-cd-player - tiny control surface for an audio CD.
+
+Two jobs, one process:
+
+1. A small window: cover art, artist/title, track list, prev/play-pause/next.
+   It replaces the insert prompt instead of disappearing after it -- pick
+   "Entire album" or any track, and the same window becomes the transport.
+
+2. An MPRIS2 service (org.mpris.MediaPlayer2.roaringcd), which is what makes
+   the keyboard media keys and the KDE panel/lockscreen widget work.  mpv has
+   no MPRIS of its own without the mpv-mpris plugin, so we publish it here and
+   proxy every call to mpv over its IPC socket.
+
+Closing the window does NOT quit: the MPRIS service stays up so the media keys
+keep working while the disc plays.  The process exits when the disc is ejected
+or playback ends.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import time
+import urllib.request
+from typing import Any
+
+os.environ.setdefault(
+    "QT_LOGGING_RULES",
+    "*.debug=false;qt.qpa.*=false;qt.dbus.integration.warning=false",
+)
+
+from PyQt6 import QtCore, QtGui, QtWidgets
+from PyQt6.QtDBus import QDBusAbstractAdaptor, QDBusConnection, QDBusMessage
+
+APP_ID = "roaringcd"
+MPRIS_SERVICE = "org.mpris.MediaPlayer2." + APP_ID
+MPRIS_PATH = "/org/mpris/MediaPlayer2"
+CONFIG_PATH = "~/.config/roaring-presence/config.json"
+CACHE_DIR = "~/.cache/roaring-presence"
+AUTOPLAY = "roaring-cd-autoplay"
+
+CDROM_DRIVE_STATUS = 0x5326
+CDS_NO_DISC, CDS_TRAY_OPEN = 1, 2
+
+USER_AGENT = "roaring-presence/1.0 ( https://github.com/roaring )"
+
+
+def expand(path: str) -> str:
+    return os.path.expanduser(os.path.expandvars(path))
+
+
+def runtime_dir() -> str:
+    return os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+
+
+def load_config() -> dict:
+    try:
+        with open(expand(CONFIG_PATH), encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def fmt_time(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "--:--"
+    seconds = int(seconds)
+    return "%d:%02d" % (seconds // 60, seconds % 60)
+
+
+def drive_status(device: str) -> int:
+    """Raw tray state, so we notice an eject without help from the provider."""
+    try:
+        fd = os.open(device, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return CDS_NO_DISC
+    try:
+        return fcntl.ioctl(fd, CDROM_DRIVE_STATUS, 0)
+    except OSError:
+        return CDS_NO_DISC
+    finally:
+        os.close(fd)
+
+
+class Mpv:
+    """Line-oriented mpv IPC client.
+
+    Every call is a fresh short-lived connection: a CD generates roughly one
+    request per second, so there is nothing to gain from holding a socket open,
+    and this way mpv restarting never leaves us wedged on a dead fd.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def command(self, *args: Any) -> Any:
+        payload = json.dumps({"command": list(args)}).encode() + b"\n"
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(0.6)
+                sock.connect(self.path)
+                sock.sendall(payload)
+                buf = b""
+                deadline = time.monotonic() + 0.6
+                while time.monotonic() < deadline:
+                    chunk = sock.recv(8192)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    for line in buf.split(b"\n"):
+                        if not line.strip():
+                            continue
+                        try:
+                            reply = json.loads(line)
+                        except ValueError:
+                            continue
+                        if "error" in reply:
+                            return reply.get("data")
+                return None
+        except (OSError, socket.timeout):
+            return None
+
+    def get(self, prop: str) -> Any:
+        return self.command("get_property", prop)
+
+    def set(self, prop: str, value: Any) -> None:
+        self.command("set_property", prop, value)
+
+    @property
+    def alive(self) -> bool:
+        return self.get("mpv-version") is not None
+
+
+class Disc:
+    """Everything we know about the disc in the tray."""
+
+    def __init__(self, device: str, payload: dict | None = None) -> None:
+        payload = payload or {}
+        self.device = device
+        self.album = payload.get("album") or ""
+        self.artist = payload.get("artist") or ""
+        self.discid = payload.get("discid") or ""
+        self.cover_url = payload.get("cover") or ""
+        self.titles: dict[int, str] = {}
+        self.total = int(payload.get("tracks") or 0)
+        for key, value in (payload.get("titles") or {}).items():
+            try:
+                self.titles[int(key)] = value
+            except (TypeError, ValueError):
+                continue
+        if self.discid and not (self.titles and self.album):
+            self._from_cache()
+
+    def _from_cache(self) -> None:
+        path = os.path.join(expand(CACHE_DIR), "disc-%s.v2.json" % self.discid)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                cached = json.load(fh)
+        except Exception:
+            return
+        self.album = self.album or cached.get("mb_album") or ""
+        self.artist = self.artist or cached.get("mb_artist") or ""
+        self.cover_url = self.cover_url or (cached.get("cover") or "")
+        for key, value in (cached.get("mb_titles") or {}).items():
+            try:
+                self.titles.setdefault(int(key), value)
+            except (TypeError, ValueError):
+                continue
+        if not self.total and self.titles:
+            self.total = max(self.titles)
+
+    def title(self, number: int) -> str:
+        return self.titles.get(number) or "Track %d" % number
+
+    def cover_path(self) -> str | None:
+        """Cover art, cached on disk so we fetch each release only once."""
+        if not self.cover_url:
+            return None
+        cache = expand(CACHE_DIR)
+        os.makedirs(cache, exist_ok=True)
+        path = os.path.join(cache, "cover-%s.jpg" % (self.discid or "unknown"))
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return path
+        try:
+            request = urllib.request.Request(
+                self.cover_url, headers={"User-Agent": USER_AGENT}
+            )
+            with urllib.request.urlopen(request, timeout=10) as response:
+                data = response.read()
+            if not data:
+                return None
+            with open(path + ".part", "wb") as fh:
+                fh.write(data)
+            os.replace(path + ".part", path)
+            return path
+        except Exception:
+            return None
+
+
+# --------------------------------------------------------------------------
+# MPRIS2
+# --------------------------------------------------------------------------
+
+
+@QtCore.pyqtClassInfo("D-Bus Interface", "org.mpris.MediaPlayer2")
+class RootAdaptor(QDBusAbstractAdaptor):
+    def __init__(self, parent: "PlayerService") -> None:
+        super().__init__(parent)
+        self._service = parent
+
+    @QtCore.pyqtSlot()
+    def Raise(self) -> None:
+        self._service.raise_window()
+
+    @QtCore.pyqtSlot()
+    def Quit(self) -> None:
+        self._service.quit()
+
+    @QtCore.pyqtProperty(bool)
+    def CanQuit(self) -> bool:
+        return True
+
+    @QtCore.pyqtProperty(bool)
+    def CanRaise(self) -> bool:
+        return True
+
+    @QtCore.pyqtProperty(bool)
+    def HasTrackList(self) -> bool:
+        return False
+
+    @QtCore.pyqtProperty(str)
+    def Identity(self) -> str:
+        return "Audio CD"
+
+    @QtCore.pyqtProperty(str)
+    def DesktopEntry(self) -> str:
+        return "roaring-cd-player"
+
+    @QtCore.pyqtProperty("QStringList")
+    def SupportedUriSchemes(self) -> list:
+        return ["cdda"]
+
+    @QtCore.pyqtProperty("QStringList")
+    def SupportedMimeTypes(self) -> list:
+        return ["audio/x-cdda"]
+
+
+@QtCore.pyqtClassInfo("D-Bus Interface", "org.mpris.MediaPlayer2.Player")
+class PlayerAdaptor(QDBusAbstractAdaptor):
+    """The interface the media keys actually land on."""
+
+    def __init__(self, parent: "PlayerService") -> None:
+        super().__init__(parent)
+        self._service = parent
+
+    @QtCore.pyqtSlot()
+    def Play(self) -> None:
+        self._service.play()
+
+    @QtCore.pyqtSlot()
+    def Pause(self) -> None:
+        self._service.pause()
+
+    @QtCore.pyqtSlot()
+    def PlayPause(self) -> None:
+        self._service.toggle()
+
+    @QtCore.pyqtSlot()
+    def Stop(self) -> None:
+        self._service.stop()
+
+    @QtCore.pyqtSlot()
+    def Next(self) -> None:
+        self._service.skip(1)
+
+    @QtCore.pyqtSlot()
+    def Previous(self) -> None:
+        self._service.skip(-1)
+
+    @QtCore.pyqtSlot("qlonglong")
+    def Seek(self, offset: int) -> None:
+        self._service.seek_relative(offset / 1_000_000.0)
+
+    @QtCore.pyqtSlot("QDBusObjectPath", "qlonglong")
+    def SetPosition(self, _track: Any, position: int) -> None:
+        self._service.seek_absolute(position / 1_000_000.0)
+
+    @QtCore.pyqtSlot(str)
+    def OpenUri(self, _uri: str) -> None:
+        return None
+
+    @QtCore.pyqtProperty(str)
+    def PlaybackStatus(self) -> str:
+        return self._service.playback_status
+
+    @QtCore.pyqtProperty("QVariantMap")
+    def Metadata(self) -> dict:
+        return self._service.metadata
+
+    @QtCore.pyqtProperty("qlonglong")
+    def Position(self) -> int:
+        return int(self._service.position * 1_000_000)
+
+    @QtCore.pyqtProperty(float)
+    def Rate(self) -> float:
+        return 1.0
+
+    @QtCore.pyqtProperty(float)
+    def MinimumRate(self) -> float:
+        return 1.0
+
+    @QtCore.pyqtProperty(float)
+    def MaximumRate(self) -> float:
+        return 1.0
+
+    @QtCore.pyqtProperty(float)
+    def Volume(self) -> float:
+        return self._service.volume
+
+    @Volume.setter
+    def Volume(self, value: float) -> None:
+        self._service.set_volume(value)
+
+    @QtCore.pyqtProperty(bool)
+    def CanGoNext(self) -> bool:
+        return self._service.playing_any
+
+    @QtCore.pyqtProperty(bool)
+    def CanGoPrevious(self) -> bool:
+        return self._service.playing_any
+
+    @QtCore.pyqtProperty(bool)
+    def CanPlay(self) -> bool:
+        return True
+
+    @QtCore.pyqtProperty(bool)
+    def CanPause(self) -> bool:
+        return self._service.playing_any
+
+    @QtCore.pyqtProperty(bool)
+    def CanSeek(self) -> bool:
+        return self._service.playing_any
+
+    @QtCore.pyqtProperty(bool)
+    def CanControl(self) -> bool:
+        return True
+
+
+class PlayerService(QtCore.QObject):
+    """Shared state + mpv control, used by both the window and MPRIS."""
+
+    changed = QtCore.pyqtSignal()
+
+    def __init__(self, disc: Disc, mpv: Mpv, config: dict) -> None:
+        super().__init__()
+        self.disc = disc
+        self.mpv = mpv
+        self.config = config
+        self.window: QtWidgets.QWidget | None = None
+        self.playback_status = "Stopped"
+        self.metadata: dict = {}
+        self.position = 0.0
+        self.track_length = 0.0
+        self.volume = 1.0
+        self.number = 0
+        self.chapters: list[float] = []
+        self._last_mpris: dict = {}
+        self._root = RootAdaptor(self)
+        self._player = PlayerAdaptor(self)
+
+    # -- registration -----------------------------------------------------
+    def register(self) -> bool:
+        bus = QDBusConnection.sessionBus()
+        if not bus.registerService(MPRIS_SERVICE):
+            return False
+        # ExportAdaptors is the one that matters: the MPRIS interfaces live on
+        # the adaptor children, and ExportAllContents does not include them.
+        return bus.registerObject(
+            MPRIS_PATH, self, QDBusConnection.RegisterOption.ExportAdaptors
+        )
+
+    # -- control ----------------------------------------------------------
+    @property
+    def playing_any(self) -> bool:
+        return self.playback_status in ("Playing", "Paused")
+
+    def play(self) -> None:
+        if self.mpv.alive:
+            self.mpv.set("pause", False)
+        else:
+            self.start(album=True)
+
+    def pause(self) -> None:
+        if self.mpv.alive:
+            self.mpv.set("pause", True)
+
+    def toggle(self) -> None:
+        if self.mpv.alive:
+            self.mpv.command("cycle", "pause")
+        else:
+            self.start(album=True)
+        self.refresh()
+
+    def stop(self) -> None:
+        if self.mpv.alive:
+            self.mpv.command("quit")
+        self.refresh()
+
+    def skip(self, delta: int) -> None:
+        """Tracks are chapters of one cdda:// stream, so skipping is chapters.
+
+        MPRIS says Previous near the start of a track should go to the previous
+        track, and otherwise restart the current one -- which is what a CD deck
+        does, so honour it.
+        """
+        if not self.mpv.alive:
+            return
+        if delta < 0 and self.position > 3.0:
+            self.mpv.command("seek", -self.position, "relative")
+        else:
+            self.mpv.command("add", "chapter", delta)
+        self.refresh()
+
+    def seek_relative(self, seconds: float) -> None:
+        if self.mpv.alive:
+            self.mpv.command("seek", seconds, "relative")
+
+    def seek_absolute(self, seconds: float) -> None:
+        """MPRIS positions are track-relative; mpv seeks the whole disc."""
+        if not self.mpv.alive:
+            return
+        base = self.chapters[self.number - 1] if 0 < self.number <= len(self.chapters) else 0.0
+        self.mpv.command("seek", base + seconds, "absolute")
+
+    def set_volume(self, value: float) -> None:
+        if self.mpv.alive:
+            self.mpv.set("volume", max(0.0, min(1.0, value)) * 100.0)
+
+    def start(self, album: bool = False, track: int | None = None) -> None:
+        """Hand off to the autoplay helper, which owns the mpv invocation."""
+        binary = shutil.which(AUTOPLAY) or expand("~/bin/" + AUTOPLAY)
+        argv = [binary, "--device", self.disc.device]
+        argv += ["--album"] if album or not track else ["--track", str(track)]
+        try:
+            subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError:
+            return
+        QtCore.QTimer.singleShot(1200, self.refresh)
+
+    def raise_window(self) -> None:
+        if self.window is not None:
+            self.window.show()
+            self.window.raise_()
+            self.window.activateWindow()
+
+    def quit(self) -> None:
+        QtWidgets.QApplication.quit()
+
+    # -- polling ----------------------------------------------------------
+    def refresh(self) -> None:
+        status = drive_status(self.disc.device)
+        if status in (CDS_NO_DISC, CDS_TRAY_OPEN):
+            self.quit()
+            return
+
+        if not self.mpv.alive:
+            if self.playback_status != "Stopped":
+                self.playback_status = "Stopped"
+                self.position = 0.0
+                self.number = 0
+                self._publish()
+                self.changed.emit()
+            return
+
+        paused = bool(self.mpv.get("pause"))
+        self.playback_status = "Paused" if paused else "Playing"
+
+        if not self.chapters:
+            for entry in self.mpv.get("chapter-list") or []:
+                try:
+                    self.chapters.append(float(entry.get("time") or 0.0))
+                except (TypeError, ValueError, AttributeError):
+                    continue
+
+        chapter = self.mpv.get("chapter")
+        self.number = int(chapter) + 1 if isinstance(chapter, (int, float)) else 0
+        if self.disc.total < len(self.chapters):
+            self.disc.total = len(self.chapters)
+
+        absolute = self.mpv.get("time-pos")
+        absolute = float(absolute) if isinstance(absolute, (int, float)) else 0.0
+        start = self.chapters[self.number - 1] if 0 < self.number <= len(self.chapters) else 0.0
+        if self.number < len(self.chapters):
+            end = self.chapters[self.number]
+        else:
+            duration = self.mpv.get("duration")
+            end = float(duration) if isinstance(duration, (int, float)) else start
+        self.position = max(0.0, absolute - start)
+        self.track_length = max(0.0, end - start)
+
+        volume = self.mpv.get("volume")
+        if isinstance(volume, (int, float)):
+            self.volume = volume / 100.0
+
+        self._publish()
+        self.changed.emit()
+
+    def _publish(self) -> None:
+        """Emit PropertiesChanged only when something actually changed.
+
+        Position deliberately stays out of it: MPRIS expects clients to poll it,
+        and broadcasting it every second would wake the panel needlessly.
+        """
+        metadata = {
+            "mpris:trackid": QtDBusObjectPath(
+                "/org/roaring/cd/track/%d" % max(self.number, 0)
+            ),
+            "mpris:length": int(self.track_length * 1_000_000),
+            "xesam:title": self.disc.title(self.number) if self.number else self.disc.album,
+            "xesam:album": self.disc.album,
+            "xesam:trackNumber": self.number,
+        }
+        if self.disc.artist:
+            metadata["xesam:artist"] = [self.disc.artist]
+            metadata["xesam:albumArtist"] = [self.disc.artist]
+        cover = self.disc.cover_path()
+        if cover:
+            metadata["mpris:artUrl"] = "file://" + cover
+        self.metadata = metadata
+
+        snapshot = {
+            "PlaybackStatus": self.playback_status,
+            "Metadata": dict(metadata, **{"mpris:trackid": str(self.number)}),
+            "CanGoNext": self.playing_any,
+            "CanGoPrevious": self.playing_any,
+            "CanPause": self.playing_any,
+            "CanSeek": self.playing_any,
+        }
+        if snapshot == self._last_mpris:
+            return
+        self._last_mpris = snapshot
+
+        message = QDBusMessage.createSignal(
+            MPRIS_PATH, "org.freedesktop.DBus.Properties", "PropertiesChanged"
+        )
+        message.setArguments(
+            [
+                "org.mpris.MediaPlayer2.Player",
+                {
+                    "PlaybackStatus": self.playback_status,
+                    "Metadata": self.metadata,
+                    "CanGoNext": self.playing_any,
+                    "CanGoPrevious": self.playing_any,
+                    "CanPause": self.playing_any,
+                    "CanSeek": self.playing_any,
+                },
+                [],
+            ]
+        )
+        QDBusConnection.sessionBus().send(message)
+
+
+def QtDBusObjectPath(path: str):
+    """QDBusObjectPath moved around between PyQt builds; degrade to a string."""
+    try:
+        from PyQt6.QtDBus import QDBusObjectPath as _Path
+
+        return _Path(path)
+    except Exception:
+        return path
+
+
+# --------------------------------------------------------------------------
+# Window
+# --------------------------------------------------------------------------
+
+STYLE = """
+QWidget#root { background: #17181c; color: #e8e8ea; }
+QLabel { color: #e8e8ea; }
+QLabel#album { color: #a8a9ad; }
+QLabel#clock { color: #8d8e93; font-size: 11px; }
+QPushButton {
+    background: #23252b; border: none; border-radius: 6px;
+    padding: 7px 12px; color: #e8e8ea; font-size: 15px;
+}
+QPushButton:hover { background: #2e3138; }
+QPushButton:pressed { background: #3a3e47; }
+QPushButton#primary { background: #2f6df6; }
+QPushButton#primary:hover { background: #4780ff; }
+QListWidget {
+    background: #1c1e23; border: none; border-radius: 6px;
+    outline: none; font-size: 12px;
+}
+QListWidget::item { padding: 4px 7px; border-radius: 4px; }
+QListWidget::item:selected { background: #2f6df6; }
+QProgressBar {
+    background: #23252b; border: none; border-radius: 2px;
+    height: 4px; text-align: center;
+}
+QProgressBar::chunk { background: #2f6df6; border-radius: 2px; }
+"""
+
+
+class Window(QtWidgets.QWidget):
+    def __init__(self, service: PlayerService) -> None:
+        super().__init__()
+        self.service = service
+        disc = service.disc
+
+        self.setObjectName("root")
+        self.setWindowTitle("Audio CD")
+        self.setStyleSheet(STYLE)
+        self.setFixedWidth(360)
+
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(14, 14, 14, 12)
+        outer.setSpacing(10)
+
+        header = QtWidgets.QHBoxLayout()
+        header.setSpacing(11)
+        self.art = QtWidgets.QLabel()
+        self.art.setFixedSize(72, 72)
+        self.art.setScaledContents(True)
+        self.art.setStyleSheet("background:#23252b;border-radius:6px;")
+        header.addWidget(self.art)
+
+        text = QtWidgets.QVBoxLayout()
+        text.setSpacing(2)
+        text.addStretch(1)
+        self.title = QtWidgets.QLabel(disc.album or "Audio CD")
+        self.title.setStyleSheet("font-size:14px;font-weight:600;")
+        self.title.setWordWrap(True)
+        self.album = QtWidgets.QLabel(
+            " \u00b7 ".join(x for x in (disc.artist, disc.album) if x) or disc.device
+        )
+        self.album.setObjectName("album")
+        self.album.setWordWrap(True)
+        self.clock = QtWidgets.QLabel("--:-- / --:--")
+        self.clock.setObjectName("clock")
+        text.addWidget(self.title)
+        text.addWidget(self.album)
+        text.addWidget(self.clock)
+        text.addStretch(1)
+        header.addLayout(text, 1)
+        outer.addLayout(header)
+
+        self.bar = QtWidgets.QProgressBar()
+        self.bar.setTextVisible(False)
+        self.bar.setRange(0, 1000)
+        outer.addWidget(self.bar)
+
+        controls = QtWidgets.QHBoxLayout()
+        controls.setSpacing(7)
+        self.prev = QtWidgets.QPushButton("\u23ee")
+        self.toggle = QtWidgets.QPushButton("\u25b6")
+        self.toggle.setObjectName("primary")
+        self.next = QtWidgets.QPushButton("\u23ed")
+        self.album_button = QtWidgets.QPushButton("Entire album")
+        self.eject = QtWidgets.QPushButton("\u23cf")
+        for widget, slot, tip in (
+            (self.prev, lambda: self.service.skip(-1), "Previous track"),
+            (self.toggle, self.service.toggle, "Play / pause"),
+            (self.next, lambda: self.service.skip(1), "Next track"),
+            (self.album_button, lambda: self.service.start(album=True), "Play the whole disc"),
+            (self.eject, self.do_eject, "Eject"),
+        ):
+            widget.setToolTip(tip)
+            widget.clicked.connect(slot)
+            controls.addWidget(widget)
+        outer.addLayout(controls)
+
+        self.tracks = QtWidgets.QListWidget()
+        self.tracks.setFixedHeight(150)
+        self.tracks.setVerticalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        for number in range(1, max(disc.total, len(disc.titles)) + 1):
+            item = QtWidgets.QListWidgetItem("%2d.  %s" % (number, disc.title(number)))
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, number)
+            self.tracks.addItem(item)
+        self.tracks.itemActivated.connect(self.play_item)
+        self.tracks.itemDoubleClicked.connect(self.play_item)
+        outer.addWidget(self.tracks)
+
+        hint = QtWidgets.QLabel("Media keys control this disc. Closing keeps them working.")
+        hint.setObjectName("clock")
+        hint.setWordWrap(True)
+        outer.addWidget(hint)
+
+        cover = disc.cover_path()
+        if cover:
+            pixmap = QtGui.QPixmap(cover)
+            if not pixmap.isNull():
+                self.art.setPixmap(pixmap)
+        service.changed.connect(self.sync)
+        self.sync()
+
+    def play_item(self, item: QtWidgets.QListWidgetItem) -> None:
+        number = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        if not number:
+            return
+        if self.service.mpv.alive:
+            self.service.mpv.command("set_property", "chapter", int(number) - 1)
+            self.service.refresh()
+        else:
+            self.service.start(track=int(number))
+
+    def do_eject(self) -> None:
+        self.service.stop()
+        subprocess.Popen(
+            ["eject", self.service.disc.device],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def sync(self) -> None:
+        service = self.service
+        disc = service.disc
+        playing = service.playback_status == "Playing"
+        self.toggle.setText("\u23f8" if playing else "\u25b6")
+
+        if service.number:
+            self.title.setText(disc.title(service.number))
+            suffix = "Track %d of %d" % (service.number, disc.total or service.number)
+            self.album.setText(
+                " \u00b7 ".join(x for x in (disc.artist, disc.album, suffix) if x)
+            )
+            self.clock.setText(
+                "%s / %s" % (fmt_time(service.position), fmt_time(service.track_length))
+            )
+            self.bar.setValue(
+                int(1000 * service.position / service.track_length)
+                if service.track_length
+                else 0
+            )
+            row = service.number - 1
+            if 0 <= row < self.tracks.count() and self.tracks.currentRow() != row:
+                self.tracks.setCurrentRow(row)
+        else:
+            self.title.setText(disc.album or "Audio CD")
+            self.album.setText(
+                " \u00b7 ".join(x for x in (disc.artist, disc.album) if x)
+                or "Insert a disc"
+            )
+            self.clock.setText("Pick a track, or play the entire album")
+            self.bar.setValue(0)
+
+        for widget in (self.prev, self.next):
+            widget.setEnabled(service.playing_any)
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        """Hide, don't quit: the MPRIS service is why the media keys work."""
+        if self.service.playing_any:
+            event.ignore()
+            self.hide()
+        else:
+            event.accept()
+            QtWidgets.QApplication.quit()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Minimal audio CD controller")
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--json", default=None, help="disc payload from the provider")
+    parser.add_argument("--no-window", action="store_true", help="MPRIS only")
+    args = parser.parse_args()
+
+    payload = {}
+    if args.json:
+        try:
+            payload = json.loads(args.json)
+        except ValueError:
+            payload = {}
+    device = args.device or payload.get("device") or "/dev/sr0"
+
+    config = load_config()
+    cd_config = config.get("cd") or {}
+    socket_path = expand(
+        cd_config.get("mpv_ipc_socket") or os.path.join(runtime_dir(), "mpv-ipc.sock")
+    )
+
+    app = QtWidgets.QApplication(sys.argv)
+    app.setApplicationName("Audio CD")
+    app.setDesktopFileName("roaring-cd-player")
+    app.setQuitOnLastWindowClosed(False)
+
+    service = PlayerService(Disc(device, payload), Mpv(socket_path), config)
+    if not service.register():
+        # Another window already owns this disc; just raise it.
+        QDBusConnection.sessionBus().call(
+            QDBusMessage.createMethodCall(
+                MPRIS_SERVICE, MPRIS_PATH, "org.mpris.MediaPlayer2", "Raise"
+            )
+        )
+        return 0
+
+    if not args.no_window:
+        service.window = Window(service)
+        service.window.show()
+
+    timer = QtCore.QTimer()
+    timer.timeout.connect(service.refresh)
+
+    def retune() -> None:
+        """1s while playing, 3s while idle -- the window is usually hidden."""
+        wanted = 1000 if service.playback_status == "Playing" else 3000
+        if timer.interval() != wanted:
+            timer.setInterval(wanted)
+
+    service.changed.connect(retune)
+    timer.start(1000)
+    service.refresh()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

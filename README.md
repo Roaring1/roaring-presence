@@ -74,11 +74,47 @@ Swap in Spotify (`https://open.spotify.com/search/%(query)s`), Songwhip, or
 anything else. `album_fallback` is used when MusicBrainz has no release for
 the disc.
 
+## Controls
+
+Inserting a disc opens `roaring-cd-player`: a small window with the cover, the
+track list, and prev / play-pause / next.  It is both the insert prompt and the
+transport -- pick “Entire album” or any track, and the same window keeps
+controlling playback instead of disappearing.
+
+It also publishes **MPRIS2** as `org.mpris.MediaPlayer2.roaringcd`, which is
+what makes the **keyboard media keys** work, along with the KDE panel widget,
+the lock screen, and `playerctl`.  mpv has no MPRIS of its own unless the
+mpv-mpris plugin is installed, so the player provides it and proxies every
+call to mpv over the IPC socket.
+
+Closing the window does not quit while a disc is playing: the MPRIS service
+stays up so the media keys keep working.  Reopen it from the panel, from the
+“Audio CD” launcher entry, or with `roaring-cd-player --device /dev/sr1`.
+The process exits on eject.
+
+Track skipping is chapter navigation, because `cdda://` is one stream whose
+chapters are the tracks.  Previous behaves like a CD deck: it restarts the
+current track unless you are within the first 3 seconds.
+
+Media keys go to whichever player the desktop considers active, so if another
+app grabs them, raise this window (or pause the other player) to hand them
+back.
+
+| Key | Meaning |
+| --- | --- |
+| `player_ui` | Open the control window on insert. `false` falls back to the old kdialog menu. |
+| `player_poll_seconds` | Poll interval while playing. |
+| `player_idle_poll_seconds` | Poll interval while stopped. |
+
 ## Playing a disc
+
+The window is the easy path; these are for scripts and keybindings:
 
 ```bash
 roaring-cd-autoplay --device /dev/sr1 --album      # whole disc
 roaring-cd-autoplay --device /dev/sr1 --track 4    # one track
+roaring-cd-player   --device /dev/sr1              # (re)open the controls
+roaring-cd-player   --device /dev/sr1 --no-window  # media keys only, no UI
 ```
 
 Playback is `mpv --cdda-device=DEV cdda://`, i.e. the raw disc. Tracks are
