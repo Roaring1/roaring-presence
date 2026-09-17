@@ -739,6 +739,25 @@ def build_activity(disc: dict, meta: dict, cfg: dict, state: dict) -> dict:
         ) or ("pause" if paused else "play")
         assets["small_text"] = "Paused" if paused else "Playing"
 
+    # Discs whose CD-Text repeats the artist in every track title would
+    # otherwise read "Title - Artist" under a `name` that is already the
+    # artist.  Drop the redundant half.
+    def strip_artist(text: str, performer: str) -> str:
+        text = (text or "").strip()
+        performer = (performer or "").strip()
+        if not text or not performer or text.lower() == performer.lower():
+            return text
+        for separator in (" - ", " \u2013 ", " \u2014 ", " / ", ": "):
+            suffix = separator + performer
+            if text.lower().endswith(suffix.lower()):
+                return text[: -len(suffix)].strip() or text
+            prefix = performer + separator
+            if text.lower().startswith(prefix.lower()):
+                return text[len(prefix) :].strip() or text
+        return text
+
+    title = strip_artist(title, artist)
+
     # Discord shows `state` under `details`.  Name the album and say where
     # on the disc we are, the way a CD player's display would.
     if number:
