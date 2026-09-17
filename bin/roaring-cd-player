@@ -206,7 +206,32 @@ class Disc:
         self.discid = payload.get("discid") or ""
         self.cover_url = payload.get("cover") or ""
         self.titles: dict[int, str] = {}
-        self.total = int(payload.get("tracks") or 0)
+
+        # "tracks" arrives as a list of {number, title} from the provider.
+        # Older callers passed a bare count, and --json is user-facing, so
+        # accept both shapes and never let a bad payload kill the window.
+        raw_tracks = payload.get("tracks")
+        self.total = 0
+        if isinstance(raw_tracks, list):
+            self.total = len(raw_tracks)
+            for entry in raw_tracks:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    number = int(entry.get("number"))
+                except (TypeError, ValueError):
+                    continue
+                title = entry.get("title")
+                if title:
+                    self.titles[number] = str(title)
+            if self.titles:
+                self.total = max(self.total, max(self.titles))
+        else:
+            try:
+                self.total = int(raw_tracks or 0)
+            except (TypeError, ValueError):
+                self.total = 0
+
         for key, value in (payload.get("titles") or {}).items():
             try:
                 self.titles[int(key)] = value
