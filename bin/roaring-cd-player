@@ -70,6 +70,14 @@ CONFIG_PATH = "~/.config/roaring-presence/config.json"
 CACHE_DIR = "~/.cache/roaring-presence"
 AUTOPLAY = "roaring-cd-autoplay"
 
+# Preload: the drive is already spinning right after an insert (the
+# provider just read the TOC and CD-Text), so opening the disc paused
+# now costs nothing and saves a second spin-up when play is pressed.
+# If the window is never touched we quit mpv again and let it spin down.
+PRELOAD_DELAY_MS = 600
+PRELOAD_IDLE_SECONDS = 60.0
+PRELOAD_CHECK_MS = 2000
+
 CDROM_DRIVE_STATUS = 0x5326
 CDS_NO_DISC, CDS_TRAY_OPEN = 1, 2
 CDS_UNKNOWN = -1
@@ -402,6 +410,81 @@ class MpvLink(QtCore.QThread):
             self.disc_gone.emit(status)
 
 
+TRACK_ALT_COLOR = "#8d8e93"
+ALT_ROLE = int(QtCore.Qt.ItemDataRole.UserRole) + 1
+
+
+class TrackDelegate(QtWidgets.QStyledItemDelegate):
+    """Draws "3.  Intro (Entrance Hall)" with the second name greyed out.
+
+    Both halves get elided, and the grey half never takes more than half the
+    row, so a long song name plus a long alternate cannot clip each other.
+    """
+
+    def paint(self, painter, option, index) -> None:
+        alt = index.data(ALT_ROLE)
+        if not alt:
+            super().paint(painter, option, index)
+            return
+
+        opt = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        label = opt.text
+        opt.text = ""  # draw the row background/selection, not the text
+        widget = opt.widget
+        style = widget.style() if widget else QtWidgets.QApplication.style()
+        style.drawControl(
+            QtWidgets.QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget
+        )
+
+        rect = style.subElementRect(
+            QtWidgets.QStyle.SubElement.SE_ItemViewItemText, opt, widget
+        ).adjusted(2, 0, -2, 0)
+        if rect.width() <= 0:
+            return
+
+        metrics = QtGui.QFontMetrics(opt.font)
+        paren = "  (%s)" % alt
+        # The alternate is the expendable half: cap it at half the row.
+        paren_width = min(
+            metrics.horizontalAdvance(paren), max(0, rect.width() // 2)
+        )
+        main = metrics.elidedText(
+            label,
+            QtCore.Qt.TextElideMode.ElideRight,
+            max(24, rect.width() - paren_width),
+        )
+        flags = int(
+            QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
+        )
+
+        painter.save()
+        painter.setFont(opt.font)
+        selected = bool(opt.state & QtWidgets.QStyle.StateFlag.State_Selected)
+        role = (
+            QtGui.QPalette.ColorRole.HighlightedText
+            if selected
+            else QtGui.QPalette.ColorRole.Text
+        )
+        painter.setPen(opt.palette.color(role))
+        painter.drawText(rect, flags, main)
+
+        used = metrics.horizontalAdvance(main)
+        rest = QtCore.QRect(
+            rect.left() + used, rect.top(), rect.width() - used, rect.height()
+        )
+        if rest.width() > 16:
+            painter.setPen(QtGui.QColor(TRACK_ALT_COLOR))
+            painter.drawText(
+                rest,
+                flags,
+                metrics.elidedText(
+                    paren, QtCore.Qt.TextElideMode.ElideRight, rest.width()
+                ),
+            )
+        painter.restore()
+
+
 # --------------------------------------------------------------------------
 # Disc
 # --------------------------------------------------------------------------
@@ -418,6 +501,9 @@ class Disc:
         self.discid = payload.get("discid") or ""
         self.cover_url = payload.get("cover") or ""
         self.titles: dict[int, str] = {}
+        # Second opinion on a title: set when the disc's own CD-Text and
+        # MusicBrainz disagree and both look real.  Shown greyed out.
+        self.alts: dict[int, str] = {}
 
         # "tracks" arrives as a list of {number, title} from the provider.
         # Older callers passed a bare count, and --json is user-facing, so
@@ -436,6 +522,9 @@ class Disc:
                 title = entry.get("title")
                 if title:
                     self.titles[number] = str(title)
+                alt = entry.get("alt")
+                if alt:
+                    self.alts[number] = str(alt)
             if self.titles:
                 self.total = max(self.total, max(self.titles))
         else:
@@ -472,6 +561,13 @@ class Disc:
 
     def title(self, number: int) -> str:
         return self.titles.get(number) or "Track %d" % number
+
+    def alt(self, number: int) -> str:
+        """The other name for this track, when there is a real one."""
+        alt = (self.alts.get(number) or "").strip()
+        if not alt or alt.casefold() == self.title(number).casefold():
+            return ""
+        return alt
 
     def cover_cached(self) -> str | None:
         """The already-downloaded cover, if any.  Never touches the network."""
@@ -728,6 +824,10 @@ class PlayerService(QtCore.QObject):
         self.starting_until = 0.0
         self.ejecting = False
 
+        # True while the paused mpv in the drive is ours and untouched, so we
+        # know we are still allowed to throw it away.
+        self.preload_owned = False
+
         self._position_at = time.monotonic()
         self._last_mpris: dict = {}
         self._root = RootAdaptor(self)
@@ -887,6 +987,7 @@ class PlayerService(QtCore.QObject):
 
     def start(self, album: bool = False, track: int | None = None) -> None:
         """Hand off to the autoplay helper, which owns the mpv invocation."""
+        self.claim_preload()
         if self.starting:
             return  # already spinning up; do not launch a second mpv
         binary = shutil.which(AUTOPLAY) or expand("~/bin/" + AUTOPLAY)
@@ -910,6 +1011,42 @@ class PlayerService(QtCore.QObject):
         self.awaiting["start"] = self.starting_until
         self.expected_number = track if track else None
         self.changed.emit()
+
+    def preload(self) -> None:
+        """Open the disc paused at track 1 so the play button is instant."""
+        if self.alive or self.starting or self.ejecting or self.preload_owned:
+            return
+        binary = shutil.which(AUTOPLAY) or expand("~/bin/" + AUTOPLAY)
+        try:
+            subprocess.Popen(
+                [binary, "--device", self.disc.device, "--preload"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            log("could not preload via %s: %s" % (AUTOPLAY, exc))
+            return
+        # Deliberately NOT starting_until: this is invisible warm-up, not a
+        # spin-up the user asked for, so the window must not show a spinner.
+        self.preload_owned = True
+        log("preloading %s" % self.disc.device)
+
+    def claim_preload(self) -> None:
+        """The user touched something; the warm mpv is theirs to keep."""
+        self.preload_owned = False
+
+    def drop_preload(self) -> bool:
+        """Throw away an untouched preload so the drive can spin down."""
+        if not self.preload_owned:
+            return False
+        self.preload_owned = False
+        if self.alive and self.playback_status == "Paused":
+            log("preload unused; letting the drive spin down")
+            self.link.send("quit")
+            return True
+        return False
 
     def eject(self) -> None:
         self.ejecting = True
@@ -1335,9 +1472,11 @@ class Window(QtWidgets.QWidget):
             QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
         )
         self.tracks.setToolTip("Double-click a track to play it")
+        self.tracks.setItemDelegate(TrackDelegate(self.tracks))
         for number in range(1, max(disc.total, len(disc.titles)) + 1):
             item = QtWidgets.QListWidgetItem("%2d.  %s" % (number, disc.title(number)))
             item.setData(QtCore.Qt.ItemDataRole.UserRole, number)
+            self._set_alt(item, disc.alt(number))
             self.tracks.addItem(item)
         # Double-click and Enter both "use" a row; single click only selects.
         self.tracks.itemDoubleClicked.connect(self.play_item)
@@ -1372,27 +1511,63 @@ class Window(QtWidgets.QWidget):
         self._spin_timer.setInterval(110)
         self._spin_timer.timeout.connect(self._spin_tick)
 
+        # Warm the drive unless the user turned it off or something is
+        # already playing.  singleShot so the window paints first.
+        self._touched = time.monotonic()
+        self._preload_timer = QtCore.QTimer(self)
+        self._preload_timer.setInterval(PRELOAD_CHECK_MS)
+        self._preload_timer.timeout.connect(self._preload_check)
+        if bool((service.config.get("cd") or {}).get("preload", True)):
+            QtCore.QTimer.singleShot(PRELOAD_DELAY_MS, self._begin_preload)
+
         service.changed.connect(self.sync)
         self.sync()
 
     # -- keyboard paths sink the matching button too ----------------------
+    def _begin_preload(self) -> None:
+        if self.service.alive or self.service.starting:
+            return  # already spinning for a real reason
+        self.service.preload()
+        if self.service.preload_owned:
+            self._preload_timer.start()
+
+    def touch(self) -> None:
+        """Mark the window as used, so a warm preload is not thrown away."""
+        self._touched = time.monotonic()
+        self.service.claim_preload()
+
     def press_toggle(self) -> None:
+        self.touch()
         self.toggle.sink()
         self.service.toggle()
 
     def press_next(self) -> None:
+        self.touch()
         self.next.sink()
         self.service.skip(1)
 
     def press_prev(self) -> None:
+        self.touch()
         self.prev.sink()
         self.service.skip(-1)
 
     def play_album(self) -> None:
+        self.touch()
         if self.service.alive:
             self.service.play_track(1)
         else:
             self.service.start(album=True)
+
+    def _preload_check(self) -> None:
+        """Drop an untouched preload after a minute of nothing happening."""
+        if not self.service.preload_owned:
+            self._preload_timer.stop()
+            return
+        if time.monotonic() - self._touched < PRELOAD_IDLE_SECONDS:
+            return
+        self._preload_timer.stop()
+        if self.service.drop_preload():
+            self.sync()
 
     # -- cover art ---------------------------------------------------------
     def set_cover(self, path: str) -> None:
@@ -1448,6 +1623,16 @@ class Window(QtWidgets.QWidget):
         if disc.album and disc.titles and self.has_cover():
             self._meta_timer.stop()
 
+    @staticmethod
+    def _set_alt(item: QtWidgets.QListWidgetItem, alt: str) -> None:
+        """Stash the second name for the delegate, and as a tooltip."""
+        item.setData(ALT_ROLE, alt or None)
+        item.setToolTip(
+            "%s (also listed as %s)" % (item.text().strip(), alt)
+            if alt
+            else "Double-click to play"
+        )
+
     def relabel_tracks(self) -> None:
         disc = self.service.disc
         total = max(disc.total, len(disc.titles), self.tracks.count())
@@ -1459,13 +1644,18 @@ class Window(QtWidgets.QWidget):
         for row in range(self.tracks.count()):
             label = "%2d.  %s" % (row + 1, disc.title(row + 1))
             item = self.tracks.item(row)
+            alt = disc.alt(row + 1)
             if item.text() != label:  # setText forces a relayout; avoid churn
                 item.setText(label)
+                self._set_alt(item, alt)
+            elif item.data(ALT_ROLE) != (alt or None):
+                self._set_alt(item, alt)
 
     def play_item(self, item: QtWidgets.QListWidgetItem) -> None:
         number = item.data(QtCore.Qt.ItemDataRole.UserRole)
         if not number:
             return
+        self.touch()
         self.service.play_track(int(number))
 
     # -- painting ----------------------------------------------------------

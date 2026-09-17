@@ -21,6 +21,7 @@ mpv specifics (verified against mpv 0.40 on this machine):
 
 Usage:
     roaring-cd-autoplay [--json PAYLOAD] [--device /dev/srN] [--track N]
+                        [--album] [--preload]
 
 PAYLOAD: {"device": "/dev/sr1", "album": ..., "artist": ...,
           "tracks": [{"number": 1, "title": "..."}, ...]}
@@ -224,17 +225,22 @@ def launch_player(device: str, payload: dict) -> bool:
     return True
 
 
-def mpv_argv(device: str, track) -> list:
+def mpv_argv(device: str, track, paused: bool = False) -> list:
     socket = os.path.join(runtime_dir(), "mpv-ipc.sock")
     argv = [
         "mpv",
         "--no-video",
         "--cdda-device=%s" % device,
         "--input-ipc-server=%s" % socket,
-        "--idle=no",
+        "--idle=yes" if paused else "--idle=no",
         "--keep-open=no",
         "--msg-level=all=warn",
     ]
+    if paused:
+        # Preload: open the disc, fill the cache, hold at 0:00.  --idle=yes
+        # keeps mpv alive if the user unpauses past the end of the cache
+        # before the drive is fully up to speed.
+        argv += ["--pause=yes", "--cache=yes"]
     if track:
         # Tracks are chapters of the single cdda:// stream.
         argv.append("--start=#%d" % int(track))
@@ -242,8 +248,8 @@ def mpv_argv(device: str, track) -> list:
     return argv
 
 
-def play(device: str, track) -> int:
-    argv = mpv_argv(device, track)
+def play(device: str, track, paused: bool = False) -> int:
+    argv = mpv_argv(device, track, paused)
 
     # Escape the presence provider's systemd cgroup when possible: otherwise a
     # `systemctl --user restart roaring-cd-presence@srN` kills playback too,
@@ -259,7 +265,7 @@ def play(device: str, track) -> int:
             "--unit=roaring-cd-autoplay-%d" % int(time.time()),
         ] + argv
 
-    log("playing: %s" % " ".join(argv))
+    log("%s: %s" % ("preloading" if paused else "playing", " ".join(argv)))
     try:
         os.makedirs(os.path.dirname(LOG), exist_ok=True)
         sink = open(LOG, "a", encoding="utf-8")
@@ -317,6 +323,11 @@ def main(argv: list) -> int:
         help="skip the prompt and play the whole disc immediately",
     )
     parser.add_argument(
+        "--preload",
+        action="store_true",
+        help="spin the drive up paused on track 1 so play starts instantly",
+    )
+    parser.add_argument(
         "--watch-eject",
         action="store_true",
         help="internal: watch the drive and stop --watch-pid on eject",
@@ -345,6 +356,12 @@ def main(argv: list) -> int:
         log("mpv is not installed")
         return 2
 
+    if args.preload:
+        # Paused on the first track: the drive is already spinning and the
+        # cache is warm, so the window's play button is instant instead of
+        # waiting out another spin-up.  The window quits this again if the
+        # user never touches it.
+        return play(device, args.track or None, paused=True)
     if args.album:
         return play(device, None)
     if args.track:

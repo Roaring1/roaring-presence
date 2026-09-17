@@ -970,6 +970,59 @@ def pad(text: str, fallback: str) -> str:
     return text[:128]
 
 
+# Discs that carry CD-Text but no real song names: the titles are literally
+# "Track 1", "Track 2".  Those are worse than nothing, because they beat the
+# MusicBrainz names we already looked up and then sit there in the UI.
+PLACEHOLDER_TITLE = re.compile(
+    r"^\s*(?:audio\s*)?(?:track|trk|song|title)[\s._-]*0*(\d+)?\s*$", re.I
+)
+
+
+def is_placeholder_title(text: str, number: int | None = None) -> bool:
+    """True for "Track 7", "track_07", "TRACK", "" and friends.
+
+    A numbered placeholder only counts when the number matches the track it
+    is on -- a song genuinely called "Track 9" sitting on track 3 is a real
+    title, however unlikely that is.
+    """
+    text = (text or "").strip()
+    if not text:
+        return True
+    match = PLACEHOLDER_TITLE.match(text)
+    if not match:
+        return False
+    found = match.group(1)
+    if found is None or number is None:
+        return True
+    return int(found) == int(number)
+
+
+def pick_title(number: int, titles: dict, mb_titles: dict, fallback=None):
+    """Best title for a track, plus the runner-up worth showing in parens.
+
+    CD-Text wins when it says something real, because it came off the disc
+    the user is holding.  When it is a placeholder, MusicBrainz wins.  If
+    both are real and they disagree, the caller gets both so the UI can show
+    "CD-Text name (MusicBrainz name)".
+    """
+    cdtext = (titles.get(number) or "").strip()
+    online = (
+        mb_titles.get(number) or mb_titles.get(str(number)) or ""
+    ).strip()
+
+    cd_real = cdtext and not is_placeholder_title(cdtext, number)
+    mb_real = online and not is_placeholder_title(online, number)
+
+    if cd_real and mb_real:
+        same = cdtext.casefold() == online.casefold()
+        return cdtext, (None if same else online)
+    if cd_real:
+        return cdtext, None
+    if mb_real:
+        return online, None
+    return (fallback or "").strip() or "Track %d" % number, None
+
+
 def build_activity(disc: dict, meta: dict, cfg: dict, state: dict) -> dict:
     cd_cfg = cfg.get("cd", {})
     assets_cfg = cfg.get("assets", {})
@@ -990,12 +1043,8 @@ def build_activity(disc: dict, meta: dict, cfg: dict, state: dict) -> dict:
         or "Unknown Artist"
     )
     if number:
-        title = (
-            titles.get(number)
-            or mb_titles.get(number)
-            or mb_titles.get(str(number))
-            or state.get("file_title")
-            or "Track %d" % number
+        title, _alt = pick_title(
+            number, titles, mb_titles, state.get("file_title")
         )
     else:
         title = state.get("file_title") or album
@@ -1240,15 +1289,12 @@ def maybe_prompt_autoplay(device: str, disc: dict, meta: dict) -> None:
     mb_titles = meta.get("mb_titles") or {}
     tracks = []
     for number in sorted(disc.get("toc") or {}):
-        tracks.append(
-            {
-                "number": number,
-                "title": titles.get(number)
-                or mb_titles.get(number)
-                or mb_titles.get(str(number))
-                or "Track %d" % number,
-            }
-        )
+        title, alt = pick_title(number, titles, mb_titles)
+        entry = {"number": number, "title": title}
+        if alt:
+            # The window shows this greyed out in parens after the title.
+            entry["alt"] = alt
+        tracks.append(entry)
     payload = {
         "device": device,
         "album": disc.get("album") or meta.get("mb_album"),
@@ -1268,6 +1314,13 @@ def maybe_prompt_autoplay(device: str, disc: dict, meta: dict) -> None:
         log.warning("autoplay prompt failed: %s", exc)
 
 
+# The player can open a disc paused at 0:00 to warm the drive (see
+# roaring-cd-player's preload).  Nothing is being listened to yet, so a
+# paused whole-disc stream this close to the start is not published as a
+# track.  Real listening moves past this within a second of pressing play.
+PRELOAD_EPSILON_SECONDS = 1.5
+
+
 def observe_playback(disc: dict, cfg: dict) -> dict:
     """Current track / pause / position, best effort.
 
@@ -1283,6 +1336,7 @@ def observe_playback(disc: dict, cfg: dict) -> dict:
     observation = {
         "playing": None,
         "paused": False,
+        "preloaded": False,
         "track": None,
         "elapsed": None,
         "length": None,
@@ -1341,6 +1395,16 @@ def observe_playback(disc: dict, cfg: dict) -> dict:
         observation["length"] = length
         if isinstance(position, (int, float)):
             observation["elapsed"] = float(position)
+        return observation
+
+    # Paused whole-disc stream still sitting at the start: that is the
+    # preload warming the drive, so publish the disc rather than a track
+    # nobody chose.  Track 1 would otherwise show up as "paused".
+    if observation["paused"] and (
+        not isinstance(position, (int, float))
+        or float(position) < PRELOAD_EPSILON_SECONDS
+    ):
+        observation["preloaded"] = True
         return observation
 
     # Whole-disc stream (Full CD.wav, cdda://): map absolute position via TOC.
@@ -1572,7 +1636,11 @@ def main(argv: list) -> int:
                     "track %s / %s%s",
                     state.get("track") or "-",
                     activity["details"],
-                    " (paused)" if state.get("paused") else "",
+                    (
+                        " (preloaded)"
+                        if state.get("preloaded")
+                        else " (paused)" if state.get("paused") else ""
+                    ),
                 )
                 push(activity)
                 last_push, last_elapsed = now, elapsed

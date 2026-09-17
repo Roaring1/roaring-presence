@@ -1,12 +1,16 @@
 # roaring-presence
 
-A small Discord Rich Presence stack for Linux. Its main job: when you put an
-audio CD in the drive, Discord shows what is actually spinning — artist, track,
-album, cover art, and a real progress bar — the way a CD player would report it.
+Discord Rich Presence for actual audio CDs, on Linux.
 
-No cloud service, no polling of a music API for "now playing". The disc itself
-is the source of truth: the table of contents is read straight from the kernel,
-and the position comes from the player over an IPC socket.
+Put a disc in the drive and Discord shows what's spinning: artist, track,
+album, cover art, real progress bar. A window pops up with the track list so
+you can actually run the thing. Take the disc out and it all goes away.
+
+Nothing phones home and nothing asks Spotify what you're listening to. The
+disc is the source of truth. The TOC and CD-Text come straight off the drive
+via ioctl, and the position comes from mpv over its IPC socket. There's no
+background daemon sitting around either -- udev starts it on insert, it exits
+when the disc is gone.
 
 ```
 Listening to Slipknot
@@ -56,6 +60,8 @@ Keys under `cd`:
 | `show_progress_bar` | `true` | Publish `timestamps` so Discord draws the bar. |
 | `progress_drift_seconds` | `2.5` | Only re-publish the bar when it actually drifted (seek, pause, stall). |
 | `autoplay_prompt` | `true` | Offer to start playback on insert. Set `false` to disable. |
+| `preload` | `true` | Open the disc paused right after insert so the first play is instant. See [Preload](#preload). |
+| `preload_idle_seconds` | `60` | If you never touch the window, the preload is dropped after this long and the drive spins down. |
 | `mpv_ipc_socket` | `$XDG_RUNTIME_DIR/mpv-ipc.sock` | Where mpv exposes position. |
 | `links` | see below | Templates for the clickable song/album links. |
 
@@ -90,6 +96,22 @@ the lock screen, and `playerctl`.  mpv has no MPRIS of its own unless the
 mpv-mpris plugin is installed, so the player provides it and proxies every
 call to mpv over the IPC socket.
 
+### Track names
+
+Plenty of discs ship CD-Text that just says `Track 1`, `Track 2`, ... which is
+useless. When the disc names look like placeholders and MusicBrainz has real
+ones, the real names win. If both sides have something real and they disagree,
+you get the disc's name with the other one after it in grey parentheses:
+
+```
+ 3.  Intro (Entrance Hall)
+```
+
+The grey half is capped at half the row and elided, so a long alternate name
+can't push the actual title off the edge. Hover for the full thing.
+
+### Buttons and keys
+
 Double-click a track (or select it and press Enter) to play it; `Space`,
 `Left` and `Right` work as play/pause and skip.  Every press is acknowledged
 immediately: the button sinks for a moment to show the click was consumed,
@@ -122,6 +144,28 @@ back.
 | `player_poll_seconds` | Poll interval while playing. |
 | `player_idle_poll_seconds` | Poll interval while stopped. |
 
+## Preload
+
+The annoying bit about the old flow: insert a disc, wait for it to be read,
+the drive spins down while you decide, then you hit play and wait for it to
+spin up *again*. Two waits for one album.
+
+So the drive is already awake when the window opens, and the window quietly
+opens the disc paused at track 1 (`roaring-cd-autoplay --preload`, which is
+mpv with `--pause=yes --idle=yes --cache=yes`). Hitting play just unpauses --
+no second spin-up.
+
+It isn't a guess about what you want, and it doesn't count as playback:
+
+- no spinner and no indeterminate bar, since you didn't ask for anything yet
+- Discord isn't told anything; a paused preload isn't "listening to"
+- touch any control -- play, pause, skip, a track, "Entire album" -- and the
+  warm mpv just becomes your session
+- touch nothing for `preload_idle_seconds` (60 by default) and it quits mpv
+  again, so the drive spins down like before
+
+Set `"preload": false` under `cd` if you'd rather the drive stay quiet.
+
 ## Playing a disc
 
 The window is the easy path; these are for scripts and keybindings:
@@ -129,6 +173,7 @@ The window is the easy path; these are for scripts and keybindings:
 ```bash
 roaring-cd-autoplay --device /dev/sr1 --album      # whole disc
 roaring-cd-autoplay --device /dev/sr1 --track 4    # one track
+roaring-cd-autoplay --device /dev/sr1 --preload    # open it paused, don't play
 roaring-cd-player   --device /dev/sr1              # (re)open the controls
 roaring-cd-player   --device /dev/sr1 --no-window  # media keys only, no UI
 ```
@@ -179,15 +224,17 @@ If the lookup still comes back empty, it is retried in the background 20s, 45s,
 and 120s later, re-probing CD-Text as well whenever the drive is idle.
 
 Titles come from CD-Text, then MusicBrainz, then the filename, then
-`Track N` — so a disc with no metadata at all still shows something sane.
+`Track N`, so a disc with nothing at all still shows something. The one
+exception is placeholder CD-Text: if the disc says `Track 4` and MusicBrainz
+has a real name, the real name wins (see [Track names](#track-names)).
 
 ## Eject
 
-On eject (or tray open, or the drive vanishing) the provider clears the Discord
-status within about a second and stops the playback it started. The autoplay
-helper also runs its own watchdog, so playback stops even when the provider
-isn't running. `SIGTERM` (`systemctl --user stop`, logout) clears the status
-too, rather than leaving a stale "listening to" behind.
+Eject, open the tray, or yank the drive: the status clears in about a second
+and whatever playback it started is stopped. The autoplay helper watches for
+this itself, so music stops even if the provider isn't running. `SIGTERM`
+(`systemctl --user stop`, logging out) clears it too, so you don't get left
+with a stale "listening to".
 
 ## Troubleshooting
 
@@ -212,5 +259,10 @@ roaring-cd-presence /dev/sr1 --once --dry-run -v     # print a payload, touch no
   `CD-Text:` line.
 - **Repeated `503` from MusicBrainz**: you are being rate-limited. The client
   already paces itself; if you lowered `poll_seconds` a long way, raise it.
-- **Manager exits on its own**: by design, after `idle_exit_seconds` with no
-  providers connected. The socket re-activates it.
+- **Manager exits on its own**: that's on purpose, after `idle_exit_seconds`
+  with no providers connected. The socket starts it again when needed.
+- **Drive spins up on its own after insert**: that's the preload. Set
+  `"preload": false` under `cd` to turn it off.
+- **Track names look wrong**: the grey name in parentheses is the other
+  source's guess (usually MusicBrainz vs CD-Text). `roaring-cd-presence
+  /dev/sr1 --once --dry-run -v` shows both.
