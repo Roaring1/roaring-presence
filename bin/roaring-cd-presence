@@ -769,10 +769,6 @@ def parse_audiocd_name(path: str) -> dict:
     return out
 
 
-def audiocd_mounts() -> list:
-    return glob.glob(os.path.join(runtime_dir(), "kio-fuse-*", "audiocd"))
-
-
 def find_playing_paths() -> list:
     """Every player holding an audiocd path or cdda:// URL, newest first."""
     try:
@@ -823,11 +819,6 @@ def find_playing_paths() -> list:
 
     found.sort(key=lambda item: item["started"], reverse=True)
     return found
-
-
-def find_playing_path() -> str:
-    players = find_playing_paths()
-    return players[0]["path"] if players else ""
 
 
 def mpv_query(sock_path: str, properties: list, timeout: float = 1.0) -> dict:
