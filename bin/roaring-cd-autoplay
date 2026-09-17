@@ -182,17 +182,44 @@ def launch_player(device: str, payload: dict) -> bool:
     if not os.access(binary, os.X_OK):
         return False
     argv = [binary, "--device", device, "--json", json.dumps(payload)]
+
+    # Run in its own transient scope.  The provider unit is
+    # KillMode=control-group, and udev restarts it on every eject/insert, so a
+    # player inside that cgroup gets SIGKILLed with it -- which is exactly why
+    # the window vanished and then refused to reopen.
+    systemd_run = shutil.which("systemd-run")
+    if systemd_run:
+        argv = [
+            systemd_run,
+            "--user",
+            "--scope",
+            "--collect",
+            "--quiet",
+            "--unit=roaring-cd-player-%d" % int(time.time()),
+        ] + argv
+
+    log_path = os.path.join(
+        os.path.expanduser("~/.cache/roaring-presence"), "player.log"
+    )
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        handle = open(log_path, "ab", buffering=0)
+    except OSError:
+        handle = subprocess.DEVNULL
     try:
         subprocess.Popen(
             argv,
             start_new_session=True,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
         )
     except OSError as exc:
         log("control window failed to start: %s" % exc)
         return False
+    finally:
+        if handle is not subprocess.DEVNULL:
+            handle.close()
     log("control window opened for %s" % device)
     return True
 

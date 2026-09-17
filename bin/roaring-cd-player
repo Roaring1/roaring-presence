@@ -37,7 +37,12 @@ os.environ.setdefault(
 )
 
 from PyQt6 import QtCore, QtGui, QtWidgets
-from PyQt6.QtDBus import QDBusAbstractAdaptor, QDBusConnection, QDBusMessage
+from PyQt6.QtDBus import (
+    QDBus,
+    QDBusAbstractAdaptor,
+    QDBusConnection,
+    QDBusMessage,
+)
 
 APP_ID = "roaringcd"
 MPRIS_SERVICE = "org.mpris.MediaPlayer2." + APP_ID
@@ -101,10 +106,15 @@ class Mpv:
         self.path = path
 
     def command(self, *args: Any) -> Any:
+        # mpv leaves the socket file behind when it exits, and connect() on a
+        # stale socket blocks for the whole timeout.  Checking first turns a
+        # 0.6s stall into a syscall.
+        if not os.path.exists(self.path):
+            return None
         payload = json.dumps({"command": list(args)}).encode() + b"\n"
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(0.6)
+                sock.settimeout(0.35)
                 sock.connect(self.path)
                 sock.sendall(payload)
                 buf = b""
@@ -126,6 +136,53 @@ class Mpv:
                 return None
         except (OSError, socket.timeout):
             return None
+
+    def batch(self, props: tuple, budget: float = 0.5) -> dict:
+        """Read several properties over a single connection.
+
+        Pipelines the requests and matches replies by request_id, so the cost
+        is one connect and one timeout budget for the whole tick instead of
+        one per property.
+        """
+        if not os.path.exists(self.path):
+            return {}
+        out: dict = {}
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(budget)
+                sock.connect(self.path)
+                sock.sendall(b"".join(
+                    json.dumps(
+                        {"command": ["get_property", prop], "request_id": i + 1}
+                    ).encode() + b"\n"
+                    for i, prop in enumerate(props)
+                ))
+                buf = b""
+                deadline = time.monotonic() + budget
+                while len(out) < len(props) and time.monotonic() < deadline:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    lines = buf.split(b"\n")
+                    buf = lines.pop()
+                    for line in lines:
+                        if not line.strip():
+                            continue
+                        try:
+                            reply = json.loads(line)
+                        except ValueError:
+                            continue
+                        rid = reply.get("request_id")
+                        if isinstance(rid, int) and 1 <= rid <= len(props):
+                            out[props[rid - 1]] = (
+                                reply.get("data")
+                                if reply.get("error") == "success"
+                                else None
+                            )
+        except (OSError, socket.timeout):
+            return out
+        return out
 
     def get(self, prop: str) -> Any:
         return self.command("get_property", prop)
@@ -476,7 +533,21 @@ class PlayerService(QtCore.QObject):
             self.quit()
             return
 
-        if not self.mpv.alive:
+        # One connection per tick, not one per property: seven blocking
+        # connects on the GUI thread is what froze the window.
+        data = self.mpv.batch(
+            (
+                "mpv-version",
+                "pause",
+                "chapter",
+                "chapter-list",
+                "time-pos",
+                "duration",
+                "volume",
+            )
+        )
+
+        if data.get("mpv-version") is None:
             if self.playback_status != "Stopped":
                 self.playback_status = "Stopped"
                 self.position = 0.0
@@ -485,33 +556,33 @@ class PlayerService(QtCore.QObject):
                 self.changed.emit()
             return
 
-        paused = bool(self.mpv.get("pause"))
+        paused = bool(data.get("pause"))
         self.playback_status = "Paused" if paused else "Playing"
 
         if not self.chapters:
-            for entry in self.mpv.get("chapter-list") or []:
+            for entry in data.get("chapter-list") or []:
                 try:
                     self.chapters.append(float(entry.get("time") or 0.0))
                 except (TypeError, ValueError, AttributeError):
                     continue
 
-        chapter = self.mpv.get("chapter")
+        chapter = data.get("chapter")
         self.number = int(chapter) + 1 if isinstance(chapter, (int, float)) else 0
         if self.disc.total < len(self.chapters):
             self.disc.total = len(self.chapters)
 
-        absolute = self.mpv.get("time-pos")
+        absolute = data.get("time-pos")
         absolute = float(absolute) if isinstance(absolute, (int, float)) else 0.0
         start = self.chapters[self.number - 1] if 0 < self.number <= len(self.chapters) else 0.0
         if self.number < len(self.chapters):
             end = self.chapters[self.number]
         else:
-            duration = self.mpv.get("duration")
+            duration = data.get("duration")
             end = float(duration) if isinstance(duration, (int, float)) else start
         self.position = max(0.0, absolute - start)
         self.track_length = max(0.0, end - start)
 
-        volume = self.mpv.get("volume")
+        volume = data.get("volume")
         if isinstance(volume, (int, float)):
             self.volume = volume / 100.0
 
@@ -797,15 +868,29 @@ def main() -> int:
     app.setDesktopFileName("roaring-cd-player")
     app.setQuitOnLastWindowClosed(False)
 
+    print("%s starting for %s" % (time.strftime("%H:%M:%S"), device), flush=True)
+
     service = PlayerService(Disc(device, payload), Mpv(socket_path), config)
-    if not service.register():
-        # Another window already owns this disc; just raise it.
-        QDBusConnection.sessionBus().call(
+    owns_mpris = service.register()
+    if not owns_mpris:
+        # Someone already owns the name.  Ask them to raise themselves, but
+        # with a timeout: a wedged instance never answers, and deferring to it
+        # unconditionally is why no window appeared after a re-insert.
+        reply = QDBusConnection.sessionBus().call(
             QDBusMessage.createMethodCall(
                 MPRIS_SERVICE, MPRIS_PATH, "org.mpris.MediaPlayer2", "Raise"
-            )
+            ),
+            QDBus.CallMode.Block,
+            1000,
         )
-        return 0
+        if reply.type() != QDBusMessage.MessageType.ErrorMessage:
+            print("raised the existing window; exiting", flush=True)
+            return 0
+        print(
+            "existing MPRIS owner is not responding; opening a window without "
+            "MPRIS (media keys stay with the stale instance until it dies)",
+            flush=True,
+        )
 
     if not args.no_window:
         service.window = Window(service)
