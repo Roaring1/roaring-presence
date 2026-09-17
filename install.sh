@@ -18,8 +18,18 @@ if [ ! -f "$HOME/.config/roaring-presence/config.json" ]; then
   echo "installed default config; set assets/client_id as needed"
 fi
 
-systemctl --user daemon-reload
-systemctl --user enable --now roaring-presenced.socket
+# "systemctl --user" needs the session bus.  Over ssh or from a non-graphical
+# shell those variables are usually unset, and daemon-reload then fails with
+# "Failed to connect to bus" -- which looks like a broken install but is not.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS=\
+  "${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+if ! systemctl --user daemon-reload 2>/dev/null; then
+  echo "warning: no user systemd session reachable; run this from your desktop" >&2
+  echo "         session, then: systemctl --user daemon-reload" >&2
+else
+  systemctl --user enable --now roaring-presenced.socket
+fi
 
 echo
 echo "Optional (needs root) -- auto-start on disc insert:"

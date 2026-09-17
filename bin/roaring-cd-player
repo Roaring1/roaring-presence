@@ -1,32 +1,51 @@
 #!/usr/bin/env python3
-"""roaring-cd-player - tiny control surface for an audio CD.
+"""roaring-cd-player - control surface + MPRIS2 service for an audio CD.
 
 Two jobs, one process:
 
-1. A small window: cover art, artist/title, track list, prev/play-pause/next.
+1. A small window: cover art, artist/title, track list, transport buttons.
    It replaces the insert prompt instead of disappearing after it -- pick
-   "Entire album" or any track, and the same window becomes the transport.
+   "Entire album" or double-click any track, and the same window becomes the
+   transport.
 
 2. An MPRIS2 service (org.mpris.MediaPlayer2.roaringcd), which is what makes
    the keyboard media keys and the KDE panel/lockscreen widget work.  mpv has
    no MPRIS of its own without the mpv-mpris plugin, so we publish it here and
    proxy every call to mpv over its IPC socket.
 
-Closing the window does NOT quit: the MPRIS service stays up so the media keys
-keep working while the disc plays.  The process exits when the disc is ejected
-or playback ends.
+Why the shape:
+
+* Nothing that can block runs on the GUI thread.  All mpv IPC and every
+  CDROM ioctl live on a worker thread; the window only paints state handed
+  to it by signal.  The previous version opened mpv's socket from the GUI
+  timer, so a single tick could stall the UI for half a second -- which is
+  what made clicks feel dropped.
+* mpv is observed, not polled.  One persistent connection with
+  observe_property, so state changes arrive as events in milliseconds
+  instead of on the next poll.
+* Every click is acknowledged the instant it is consumed: the button sinks,
+  then stays dimmed while the action is still unconfirmed.  Rapid presses
+  are counted and coalesced rather than silently dropped, so spamming skip
+  behaves like a real transport and *looks* like one too.
+
+Closing the window does NOT quit: the MPRIS service stays up so the media
+keys keep working while the disc plays.  The process exits when the disc is
+ejected or playback ends.
 """
 from __future__ import annotations
 
 import argparse
+import collections
+import errno
 import fcntl
 import json
 import os
+import select
 import shutil
 import socket
-import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from typing import Any
@@ -53,6 +72,24 @@ AUTOPLAY = "roaring-cd-autoplay"
 
 CDROM_DRIVE_STATUS = 0x5326
 CDS_NO_DISC, CDS_TRAY_OPEN = 1, 2
+CDS_UNKNOWN = -1
+
+# A drive that has just swallowed a disc answers "no disc" -- and fails
+# open() with ENOMEDIUM -- for a second or two while it spins up.  The window
+# used to quit on that first reading, so it appeared and vanished again
+# before the disc was even readable.  Require consecutive confirmations, and
+# none at all during the initial spin-up window.  A user-requested eject
+# skips both, because then "no disc" is the expected answer.
+GONE_GRACE_SECONDS = 25.0
+GONE_CONFIRMATIONS = 2
+DRIVE_POLL_SECONDS = 1.0
+
+# How long a sent-but-unconfirmed command stays "pending" in the UI before we
+# assume it was swallowed by mpv (a seek past the end of the disc, say).
+PENDING_TIMEOUT = 3.5
+# Rapid skips are coalesced into one mpv command; long enough to catch a
+# double-tap, short enough that a single press still feels immediate.
+SKIP_DEBOUNCE_MS = 170
 
 USER_AGENT = "roaring-presence/1.0 ( https://github.com/roaring )"
 
@@ -80,119 +117,294 @@ def fmt_time(seconds: float | None) -> str:
     return "%d:%02d" % (seconds // 60, seconds % 60)
 
 
+def log(message: str) -> None:
+    print("%s %s" % (time.strftime("%H:%M:%S"), message), flush=True)
+
+
 def drive_status(device: str) -> int:
     """Raw tray state, so we notice an eject without help from the provider."""
     try:
         fd = os.open(device, os.O_RDONLY | os.O_NONBLOCK)
-    except OSError:
-        return CDS_NO_DISC
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            # The device node itself went away: a USB drive was unplugged.
+            return CDS_NO_DISC
+        # ENOMEDIUM while the disc spins up, EBUSY while another reader holds
+        # the drive, EIO on a re-seat: none of these mean ejected.
+        return CDS_UNKNOWN
     try:
         return fcntl.ioctl(fd, CDROM_DRIVE_STATUS, 0)
     except OSError:
-        return CDS_NO_DISC
+        return CDS_UNKNOWN
     finally:
         os.close(fd)
 
 
-class Mpv:
-    """Line-oriented mpv IPC client.
+# --------------------------------------------------------------------------
+# mpv link (worker thread)
+# --------------------------------------------------------------------------
 
-    Every call is a fresh short-lived connection: a CD generates roughly one
-    request per second, so there is nothing to gain from holding a socket open,
-    and this way mpv restarting never leaves us wedged on a dead fd.
+
+class MpvLink(QtCore.QThread):
+    """Event-driven mpv IPC client, and the only place we block.
+
+    Holds one persistent connection and lets mpv push state with
+    observe_property.  Commands are queued from the GUI thread and flushed
+    here, so a click costs the UI a deque append and nothing else.
     """
 
-    def __init__(self, path: str) -> None:
-        self.path = path
+    # time-pos last: the ordering is also the order mpv replies, and the
+    # cheap fields arriving first means the first paint is complete sooner.
+    PROPS = (
+        "pause",
+        "chapter",
+        "chapter-list",
+        "duration",
+        "volume",
+        "time-pos",
+    )
 
-    def command(self, *args: Any) -> Any:
-        # mpv leaves the socket file behind when it exits, and connect() on a
-        # stale socket blocks for the whole timeout.  Checking first turns a
-        # 0.6s stall into a syscall.
-        if not os.path.exists(self.path):
-            return None
-        payload = json.dumps({"command": list(args)}).encode() + b"\n"
+    state = QtCore.pyqtSignal(dict)
+    disc_gone = QtCore.pyqtSignal(int)
+
+    #: Coalescing window for state pushed to the GUI.  mpv reports time-pos
+    #: many times a second; four repaints a second is smooth and nearly free.
+    EMIT_INTERVAL = 0.25
+    RECONNECT_INTERVAL = 0.4
+
+    def __init__(self, socket_path: str, device: str, parent=None) -> None:
+        super().__init__(parent)
+        self.socket_path = socket_path
+        self.device = device
+        self.expect_eject = False  # set by the eject button; read here
+        self._outbox: collections.deque = collections.deque()
+        self._lock = threading.Lock()
+        self._wake_r, self._wake_w = os.pipe()
+        os.set_blocking(self._wake_r, False)
+        os.set_blocking(self._wake_w, False)
+        self._quit = threading.Event()
+        self._sock: socket.socket | None = None
+        self._buf = b""
+        self._props: dict = {}
+        self._ids: dict = {}
+        self._next_id = 100
+        self._dirty = False
+        self._last_emit = 0.0
+        self._offline_sent = False
+        self._next_connect = 0.0
+        self._next_drive = 0.0
+        self._gone_ticks = 0
+        self._started_at = time.monotonic()
+
+    # -- public API (GUI thread) ------------------------------------------
+    def send(self, *args: Any) -> None:
+        """Queue one mpv command.  Never blocks, never raises."""
+        with self._lock:
+            self._outbox.append(list(args))
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(0.35)
-                sock.connect(self.path)
-                sock.sendall(payload)
-                buf = b""
-                deadline = time.monotonic() + 0.6
-                while time.monotonic() < deadline:
-                    chunk = sock.recv(8192)
-                    if not chunk:
-                        break
-                    buf += chunk
-                    for line in buf.split(b"\n"):
-                        if not line.strip():
-                            continue
-                        try:
-                            reply = json.loads(line)
-                        except ValueError:
-                            continue
-                        if "error" in reply:
-                            return reply.get("data")
-                return None
-        except (OSError, socket.timeout):
-            return None
+            os.write(self._wake_w, b"\x01")
+        except OSError:
+            pass  # pipe full: the worker is already about to wake up
 
-    def batch(self, props: tuple, budget: float = 0.5) -> dict:
-        """Read several properties over a single connection.
-
-        Pipelines the requests and matches replies by request_id, so the cost
-        is one connect and one timeout budget for the whole tick instead of
-        one per property.
-        """
-        if not os.path.exists(self.path):
-            return {}
-        out: dict = {}
+    def shutdown(self) -> None:
+        self._quit.set()
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(budget)
-                sock.connect(self.path)
-                sock.sendall(b"".join(
-                    json.dumps(
-                        {"command": ["get_property", prop], "request_id": i + 1}
-                    ).encode() + b"\n"
-                    for i, prop in enumerate(props)
-                ))
-                buf = b""
-                deadline = time.monotonic() + budget
-                while len(out) < len(props) and time.monotonic() < deadline:
-                    chunk = sock.recv(65536)
-                    if not chunk:
-                        break
-                    buf += chunk
-                    lines = buf.split(b"\n")
-                    buf = lines.pop()
-                    for line in lines:
-                        if not line.strip():
-                            continue
-                        try:
-                            reply = json.loads(line)
-                        except ValueError:
-                            continue
-                        rid = reply.get("request_id")
-                        if isinstance(rid, int) and 1 <= rid <= len(props):
-                            out[props[rid - 1]] = (
-                                reply.get("data")
-                                if reply.get("error") == "success"
-                                else None
-                            )
-        except (OSError, socket.timeout):
-            return out
-        return out
+            os.write(self._wake_w, b"\x01")
+        except OSError:
+            pass
 
-    def get(self, prop: str) -> Any:
-        return self.command("get_property", prop)
+    # -- worker ------------------------------------------------------------
+    def run(self) -> None:  # noqa: C901 - a select loop is one thought
+        while not self._quit.is_set():
+            now = time.monotonic()
+            if self._sock is None and now >= self._next_connect:
+                self._connect()
 
-    def set(self, prop: str, value: Any) -> None:
-        self.command("set_property", prop, value)
+            watch = [self._wake_r]
+            if self._sock is not None:
+                watch.append(self._sock)
+            try:
+                ready, _, _ = select.select(watch, [], [], 0.2)
+            except (OSError, ValueError):
+                ready = []
 
-    @property
-    def alive(self) -> bool:
-        return self.get("mpv-version") is not None
+            if self._wake_r in ready:
+                self._drain_wakeups()
+            self._flush()
+            if self._sock is not None and self._sock in ready:
+                self._read()
+            self._tick()
+
+        self._disconnect(quiet=True)
+        for fd in (self._wake_r, self._wake_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _drain_wakeups(self) -> None:
+        while True:
+            try:
+                if not os.read(self._wake_r, 4096):
+                    return
+            except BlockingIOError:
+                return
+            except OSError:
+                return
+
+    def _connect(self) -> None:
+        self._next_connect = time.monotonic() + self.RECONNECT_INTERVAL
+        if not os.path.exists(self.socket_path):
+            self._offline()
+            return
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(0.25)
+            sock.connect(self.socket_path)
+        except OSError:
+            # mpv leaves its socket file behind when it exits, so a stale
+            # path is normal rather than an error worth reporting.
+            try:
+                sock.close()
+            except OSError:
+                pass
+            self._offline()
+            return
+        sock.setblocking(False)
+        self._sock = sock
+        self._buf = b""
+        self._props = {}
+        self._ids = {}
+        self._offline_sent = False
+        for prop in self.PROPS:
+            self._next_id += 1
+            self._ids[self._next_id] = prop
+            # observe_property replies with the current value immediately, so
+            # this doubles as the initial read.
+            self._write({"command": ["observe_property", self._next_id, prop]})
+        log("mpv connected (%s)" % self.socket_path)
+        self._dirty = True
+
+    def _disconnect(self, quiet: bool = False) -> None:
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+            if not quiet:
+                log("mpv gone")
+        self._buf = b""
+        self._props = {}
+        self._ids = {}
+
+    def _offline(self) -> None:
+        if self._sock is not None:
+            self._disconnect()
+        if self._offline_sent:
+            return
+        self._offline_sent = True
+        self.state.emit({"alive": False})
+
+    def _write(self, obj: dict) -> None:
+        if self._sock is None:
+            return
+        payload = json.dumps(obj).encode() + b"\n"
+        try:
+            self._sock.sendall(payload)
+        except BlockingIOError:
+            # Commands are a few dozen bytes and mpv drains promptly; a full
+            # buffer means mpv is wedged, so drop rather than stall the loop.
+            log("mpv write would block; dropped %s" % obj.get("command"))
+        except OSError:
+            self._disconnect()
+
+    def _flush(self) -> None:
+        while True:
+            with self._lock:
+                if not self._outbox:
+                    return
+                if self._sock is None:
+                    # Nobody to talk to: discard so a queue built up while
+                    # mpv was dead cannot fire all at once when it returns.
+                    self._outbox.clear()
+                    return
+                command = self._outbox.popleft()
+            self._write({"command": command})
+
+    def _read(self) -> None:
+        try:
+            chunk = self._sock.recv(65536)
+        except BlockingIOError:
+            return
+        except OSError:
+            self._disconnect()
+            return
+        if not chunk:
+            self._disconnect()
+            return
+        self._buf += chunk
+        lines = self._buf.split(b"\n")
+        self._buf = lines.pop()
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            self._handle(message)
+
+    def _handle(self, message: dict) -> None:
+        event = message.get("event")
+        if event == "property-change":
+            name = message.get("name") or self._ids.get(message.get("id"))
+            if name:
+                self._props[name] = message.get("data")
+                self._dirty = True
+            return
+        if event in ("shutdown", "idle"):
+            self._disconnect()
+            return
+        if event is None and "request_id" in message:
+            name = self._ids.get(message.get("request_id"))
+            if name and message.get("error") == "success":
+                self._props[name] = message.get("data")
+                self._dirty = True
+
+    def _tick(self) -> None:
+        now = time.monotonic()
+
+        if now >= self._next_drive:
+            self._next_drive = now + DRIVE_POLL_SECONDS
+            self._check_drive(now)
+
+        if self._dirty and now - self._last_emit >= self.EMIT_INTERVAL:
+            self._last_emit = now
+            self._dirty = False
+            snapshot = dict(self._props)
+            snapshot["alive"] = True
+            self.state.emit(snapshot)
+
+    def _check_drive(self, now: float) -> None:
+        status = drive_status(self.device)
+        if status not in (CDS_NO_DISC, CDS_TRAY_OPEN):
+            self._gone_ticks = 0
+            return
+        self._gone_ticks += 1
+        if self.expect_eject:
+            # We asked for this; no need to second-guess the drive.
+            self.disc_gone.emit(status)
+            return
+        if now - self._started_at <= GONE_GRACE_SECONDS:
+            return
+        if self._gone_ticks >= GONE_CONFIRMATIONS:
+            self.disc_gone.emit(status)
+
+
+# --------------------------------------------------------------------------
+# Disc
+# --------------------------------------------------------------------------
 
 
 class Disc:
@@ -266,8 +478,11 @@ class Disc:
         path = os.path.join(
             expand(CACHE_DIR), "cover-%s.jpg" % (self.discid or "unknown")
         )
-        if os.path.exists(path) and os.path.getsize(path) > 0:
-            return path
+        try:
+            if os.path.getsize(path) > 0:
+                return path
+        except OSError:
+            return None
         return None
 
     def refresh_metadata(self) -> bool:
@@ -275,17 +490,26 @@ class Disc:
         before = (self.album, self.artist, self.cover_url, len(self.titles))
         if self.discid:
             self._from_cache()
-        return before != (self.album, self.artist, self.cover_url, len(self.titles))
+        return before != (
+            self.album,
+            self.artist,
+            self.cover_url,
+            len(self.titles),
+        )
 
     def cover_path(self) -> str | None:
         """Cover art, cached on disk so we fetch each release only once."""
         if not self.cover_url:
             return None
+        cached = self.cover_cached()
+        if cached:
+            return cached
         cache = expand(CACHE_DIR)
-        os.makedirs(cache, exist_ok=True)
+        try:
+            os.makedirs(cache, exist_ok=True)
+        except OSError:
+            return None
         path = os.path.join(cache, "cover-%s.jpg" % (self.discid or "unknown"))
-        if os.path.exists(path) and os.path.getsize(path) > 0:
-            return path
         try:
             request = urllib.request.Request(
                 self.cover_url, headers={"User-Agent": USER_AGENT}
@@ -294,17 +518,27 @@ class Disc:
                 data = response.read()
             if not data:
                 return None
-            with open(path + ".part", "wb") as fh:
+            temp = "%s.%d.part" % (path, os.getpid())
+            with open(temp, "wb") as fh:
                 fh.write(data)
-            os.replace(path + ".part", path)
+            os.replace(temp, path)
             return path
         except Exception:
             return None
 
-
 # --------------------------------------------------------------------------
 # MPRIS2
 # --------------------------------------------------------------------------
+
+
+def QtDBusObjectPath(path: str):
+    """QDBusObjectPath moved around between PyQt builds; degrade to a string."""
+    try:
+        from PyQt6.QtDBus import QDBusObjectPath as _Path
+
+        return _Path(path)
+    except Exception:
+        return path
 
 
 @QtCore.pyqtClassInfo("D-Bus Interface", "org.mpris.MediaPlayer2")
@@ -404,7 +638,7 @@ class PlayerAdaptor(QDBusAbstractAdaptor):
 
     @QtCore.pyqtProperty("qlonglong")
     def Position(self) -> int:
-        return int(self._service.position * 1_000_000)
+        return int(self._service.live_position() * 1_000_000)
 
     @QtCore.pyqtProperty(float)
     def Rate(self) -> float:
@@ -451,17 +685,30 @@ class PlayerAdaptor(QDBusAbstractAdaptor):
         return True
 
 
+# --------------------------------------------------------------------------
+# Service
+# --------------------------------------------------------------------------
+
+
 class PlayerService(QtCore.QObject):
-    """Shared state + mpv control, used by both the window and MPRIS."""
+    """Shared state + mpv control, used by both the window and MPRIS.
+
+    Also the bookkeeper for *intent*: what the user asked for, whether it has
+    been sent, and whether playback has confirmed it yet.  The window renders
+    that directly, which is what makes a spammed button legible instead of
+    ambiguous.
+    """
 
     changed = QtCore.pyqtSignal()
 
-    def __init__(self, disc: Disc, mpv: Mpv, config: dict) -> None:
+    def __init__(self, disc: Disc, link: MpvLink, config: dict) -> None:
         super().__init__()
         self.disc = disc
-        self.mpv = mpv
+        self.link = link
         self.config = config
         self.window: QtWidgets.QWidget | None = None
+
+        self.alive = False
         self.playback_status = "Stopped"
         self.metadata: dict = {}
         self.position = 0.0
@@ -469,9 +716,37 @@ class PlayerService(QtCore.QObject):
         self.volume = 1.0
         self.number = 0
         self.chapters: list[float] = []
+
+        # Intent bookkeeping.  "queued" is what we have not sent yet (skips
+        # are coalesced); "awaiting" is sent but unconfirmed, keyed by the
+        # kind of action so the matching button can dim itself.
+        self.queued_skip = 0
+        self.skip_dir = 0
+        self.awaiting: dict[str, float] = {}
+        self.expected_status: str | None = None
+        self.expected_number: int | None = None
+        self.starting_until = 0.0
+        self.ejecting = False
+
+        self._position_at = time.monotonic()
         self._last_mpris: dict = {}
         self._root = RootAdaptor(self)
         self._player = PlayerAdaptor(self)
+
+        self._skip_timer = QtCore.QTimer(self)
+        self._skip_timer.setSingleShot(True)
+        self._skip_timer.setInterval(SKIP_DEBOUNCE_MS)
+        self._skip_timer.timeout.connect(self._flush_skips)
+
+        # One timer expires stale intents, so a command mpv ignored cannot
+        # leave a button dimmed forever.
+        self._expiry = QtCore.QTimer(self)
+        self._expiry.setInterval(500)
+        self._expiry.timeout.connect(self._expire)
+        self._expiry.start()
+
+        link.state.connect(self.on_state)
+        link.disc_gone.connect(self.on_disc_gone)
 
     # -- registration -----------------------------------------------------
     def register(self) -> bool:
@@ -484,66 +759,135 @@ class PlayerService(QtCore.QObject):
             MPRIS_PATH, self, QDBusConnection.RegisterOption.ExportAdaptors
         )
 
-    # -- control ----------------------------------------------------------
+    # -- derived state ----------------------------------------------------
     @property
     def playing_any(self) -> bool:
         return self.playback_status in ("Playing", "Paused")
 
+    @property
+    def starting(self) -> bool:
+        return time.monotonic() < self.starting_until and not self.playing_any
+
+    def live_position(self) -> float:
+        """Position interpolated to now.
+
+        State arrives four times a second; MPRIS clients and the progress bar
+        both want something smoother, and playback rate is always 1.0 here.
+        """
+        if self.playback_status != "Playing":
+            return self.position
+        drift = time.monotonic() - self._position_at
+        if self.track_length:
+            return min(self.track_length, self.position + drift)
+        return self.position + drift
+
+    def pending(self, kind: str) -> int:
+        """How many presses of `kind` are still in flight, for the badge."""
+        if kind == "skip":
+            return abs(self.queued_skip) + (1 if "skip" in self.awaiting else 0)
+        return 1 if kind in self.awaiting else 0
+
+    # -- control (all non-blocking) ---------------------------------------
     def play(self) -> None:
-        if self.mpv.alive:
-            self.mpv.set("pause", False)
+        if self.alive:
+            self.link.send("set_property", "pause", False)
+            self._expect_status("Playing")
         else:
             self.start(album=True)
 
     def pause(self) -> None:
-        if self.mpv.alive:
-            self.mpv.set("pause", True)
+        if self.alive:
+            self.link.send("set_property", "pause", True)
+            self._expect_status("Paused")
 
     def toggle(self) -> None:
-        if self.mpv.alive:
-            self.mpv.command("cycle", "pause")
-        else:
+        if not self.alive:
             self.start(album=True)
-        self.refresh()
+            return
+        # Toggle against what the user last asked for, not just what mpv last
+        # said, so two fast clicks are two toggles rather than one.
+        current = self.expected_status or self.playback_status
+        if current == "Playing":
+            self.pause()
+        else:
+            self.play()
 
     def stop(self) -> None:
-        if self.mpv.alive:
-            self.mpv.command("quit")
-        self.refresh()
+        if self.alive:
+            self.link.send("quit")
+        self.expected_status = None
+        self.awaiting.pop("toggle", None)
+        self.changed.emit()
 
     def skip(self, delta: int) -> None:
-        """Tracks are chapters of one cdda:// stream, so skipping is chapters.
-
-        MPRIS says Previous near the start of a track should go to the previous
-        track, and otherwise restart the current one -- which is what a CD deck
-        does, so honour it.
-        """
-        if not self.mpv.alive:
+        """Queue a track skip; rapid presses coalesce into one mpv command."""
+        if not self.alive:
             return
-        if delta < 0 and self.position > 3.0:
-            self.mpv.command("seek", -self.position, "relative")
+        self.queued_skip += delta
+        self.skip_dir = 1 if delta > 0 else -1
+        self._skip_timer.start()
+        self.changed.emit()
+
+    def _flush_skips(self) -> None:
+        delta, self.queued_skip = self.queued_skip, 0
+        if not delta or not self.alive:
+            self.changed.emit()
+            return
+        # MPRIS says Previous near the start of a track restarts it, which is
+        # what a CD deck does -- but only for a lone press, never mid-spam.
+        if delta == -1 and self.live_position() > 3.0:
+            self.link.send("seek", -self.live_position(), "relative")
+            self.position = 0.0
+            self._position_at = time.monotonic()
         else:
-            self.mpv.command("add", "chapter", delta)
-        self.refresh()
+            self.link.send("add", "chapter", delta)
+            target = self.number + delta
+            total = self.disc.total or len(self.chapters)
+            if total:
+                target = max(1, min(total, target))
+            self.expected_number = target
+            self.awaiting["skip"] = time.monotonic() + PENDING_TIMEOUT
+        self.changed.emit()
+
+    def play_track(self, number: int) -> None:
+        if self.alive:
+            self.link.send("set_property", "chapter", int(number) - 1)
+            self.link.send("set_property", "pause", False)
+            self.expected_number = int(number)
+            self.expected_status = "Playing"
+            self.awaiting["track"] = time.monotonic() + PENDING_TIMEOUT
+            self.queued_skip = 0
+        else:
+            self.start(track=int(number))
+        self.changed.emit()
 
     def seek_relative(self, seconds: float) -> None:
-        if self.mpv.alive:
-            self.mpv.command("seek", seconds, "relative")
+        if self.alive:
+            self.link.send("seek", seconds, "relative")
 
     def seek_absolute(self, seconds: float) -> None:
         """MPRIS positions are track-relative; mpv seeks the whole disc."""
-        if not self.mpv.alive:
+        if not self.alive:
             return
-        base = self.chapters[self.number - 1] if 0 < self.number <= len(self.chapters) else 0.0
-        self.mpv.command("seek", base + seconds, "absolute")
+        base = (
+            self.chapters[self.number - 1]
+            if 0 < self.number <= len(self.chapters)
+            else 0.0
+        )
+        self.link.send("seek", base + seconds, "absolute")
 
     def set_volume(self, value: float) -> None:
-        if self.mpv.alive:
-            self.mpv.set("volume", max(0.0, min(1.0, value)) * 100.0)
+        if self.alive:
+            self.link.send("set_property", "volume", max(0.0, min(1.0, value)) * 100.0)
+
+    def _expect_status(self, status: str) -> None:
+        self.expected_status = status
+        self.awaiting["toggle"] = time.monotonic() + PENDING_TIMEOUT
+        self.changed.emit()
 
     def start(self, album: bool = False, track: int | None = None) -> None:
         """Hand off to the autoplay helper, which owns the mpv invocation."""
-        if getattr(self, "starting", False):
+        if self.starting:
             return  # already spinning up; do not launch a second mpv
         binary = shutil.which(AUTOPLAY) or expand("~/bin/" + AUTOPLAY)
         argv = [binary, "--device", self.disc.device]
@@ -556,21 +900,35 @@ class PlayerService(QtCore.QObject):
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
-        except OSError:
+        except OSError as exc:
+            log("could not launch %s: %s" % (AUTOPLAY, exc))
             return
-        # A CD takes seconds to spin up.  Say so at once, poll harder than
-        # usual until audio appears, and give up the "starting" state so a
-        # failed launch cannot wedge the UI.
-        self.starting = True
+        # A cold drive takes several seconds.  Say so at once; the link
+        # reconnects on its own the moment mpv's socket appears, so there is
+        # nothing to poll here.
+        self.starting_until = time.monotonic() + 25.0
+        self.awaiting["start"] = self.starting_until
+        self.expected_number = track if track else None
         self.changed.emit()
-        for delay in (400, 900, 1500, 2500, 4000, 6000, 9000):
-            QtCore.QTimer.singleShot(delay, self.refresh)
-        QtCore.QTimer.singleShot(10000, self.clear_starting)
 
-    def clear_starting(self) -> None:
-        if getattr(self, "starting", False):
-            self.starting = False
-            self.changed.emit()
+    def eject(self) -> None:
+        self.ejecting = True
+        self.link.expect_eject = True
+        if self.alive:
+            self.link.send("quit")
+        try:
+            subprocess.Popen(
+                ["eject", self.disc.device],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            log("eject failed: %s" % exc)
+            self.ejecting = False
+            self.link.expect_eject = False
+        self.changed.emit()
 
     def raise_window(self) -> None:
         if self.window is not None:
@@ -581,89 +939,126 @@ class PlayerService(QtCore.QObject):
     def quit(self) -> None:
         QtWidgets.QApplication.quit()
 
-    # -- polling ----------------------------------------------------------
-    def refresh(self) -> None:
-        status = drive_status(self.disc.device)
-        if status in (CDS_NO_DISC, CDS_TRAY_OPEN):
-            self.quit()
+    # -- state -------------------------------------------------------------
+    def on_disc_gone(self, status: int) -> None:
+        log("disc gone (status %d); exiting" % status)
+        self.quit()
+
+    def on_state(self, snapshot: dict) -> None:
+        if not snapshot.get("alive"):
+            self._go_stopped()
             return
 
-        # One connection per tick, not one per property: seven blocking
-        # connects on the GUI thread is what froze the window.
-        data = self.mpv.batch(
-            (
-                "mpv-version",
-                "pause",
-                "chapter",
-                "chapter-list",
-                "time-pos",
-                "duration",
-                "volume",
-            )
-        )
+        self.alive = True
+        self.starting_until = 0.0
+        self.awaiting.pop("start", None)
 
-        if data.get("mpv-version") is None:
-            if self.playback_status != "Stopped":
-                self.playback_status = "Stopped"
-                self.position = 0.0
-                self.number = 0
-                self._publish()
-                self.changed.emit()
-            return
-
-        paused = bool(data.get("pause"))
+        paused = bool(snapshot.get("pause"))
         self.playback_status = "Paused" if paused else "Playing"
 
-        if not self.chapters:
-            for entry in data.get("chapter-list") or []:
+        chapter_list = snapshot.get("chapter-list")
+        if isinstance(chapter_list, list) and len(chapter_list) != len(self.chapters):
+            chapters = []
+            for entry in chapter_list:
                 try:
-                    self.chapters.append(float(entry.get("time") or 0.0))
+                    chapters.append(float(entry.get("time") or 0.0))
                 except (TypeError, ValueError, AttributeError):
                     continue
+            if chapters:
+                self.chapters = chapters
 
-        chapter = data.get("chapter")
+        chapter = snapshot.get("chapter")
         self.number = int(chapter) + 1 if isinstance(chapter, (int, float)) else 0
         if self.disc.total < len(self.chapters):
             self.disc.total = len(self.chapters)
 
-        absolute = data.get("time-pos")
+        absolute = snapshot.get("time-pos")
         absolute = float(absolute) if isinstance(absolute, (int, float)) else 0.0
-        start = self.chapters[self.number - 1] if 0 < self.number <= len(self.chapters) else 0.0
+        start = (
+            self.chapters[self.number - 1]
+            if 0 < self.number <= len(self.chapters)
+            else 0.0
+        )
         if self.number < len(self.chapters):
             end = self.chapters[self.number]
         else:
-            duration = data.get("duration")
+            duration = snapshot.get("duration")
             end = float(duration) if isinstance(duration, (int, float)) else start
         self.position = max(0.0, absolute - start)
         self.track_length = max(0.0, end - start)
+        self._position_at = time.monotonic()
 
-        volume = data.get("volume")
+        volume = snapshot.get("volume")
         if isinstance(volume, (int, float)):
             self.volume = volume / 100.0
 
+        self._settle()
         self._publish()
+        self.changed.emit()
+
+    def _go_stopped(self) -> None:
+        was = (self.alive, self.playback_status)
+        self.alive = False
+        self.playback_status = "Stopped"
+        self.position = 0.0
+        self.track_length = 0.0
+        self.number = 0
+        self.chapters = []
+        if was != (False, "Stopped"):
+            self._publish()
+        self._settle()
+        self.changed.emit()
+
+    def _settle(self) -> None:
+        """Drop intents that playback has now confirmed."""
+        if self.expected_status and self.playback_status == self.expected_status:
+            self.expected_status = None
+            self.awaiting.pop("toggle", None)
+        if self.expected_number is not None and self.number == self.expected_number:
+            self.expected_number = None
+            self.awaiting.pop("skip", None)
+            self.awaiting.pop("track", None)
+
+    def _expire(self) -> None:
+        now = time.monotonic()
+        stale = [kind for kind, deadline in self.awaiting.items() if deadline <= now]
+        if not stale:
+            # Still nudge the window while playing so the bar interpolates.
+            if self.playback_status == "Playing" and self.window is not None:
+                self.window.tick()
+            return
+        for kind in stale:
+            self.awaiting.pop(kind, None)
+            if kind == "toggle":
+                self.expected_status = None
+            elif kind in ("skip", "track"):
+                self.expected_number = None
+            elif kind == "start":
+                self.starting_until = 0.0
         self.changed.emit()
 
     def _publish(self) -> None:
         """Emit PropertiesChanged only when something actually changed.
 
-        Position deliberately stays out of it: MPRIS expects clients to poll it,
-        and broadcasting it every second would wake the panel needlessly.
+        Position deliberately stays out of it: MPRIS expects clients to poll
+        it, and broadcasting every tick would wake the panel needlessly.
         """
         metadata = {
             "mpris:trackid": QtDBusObjectPath(
                 "/org/roaring/cd/track/%d" % max(self.number, 0)
             ),
             "mpris:length": int(self.track_length * 1_000_000),
-            "xesam:title": self.disc.title(self.number) if self.number else self.disc.album,
+            "xesam:title": (
+                self.disc.title(self.number) if self.number else self.disc.album
+            ),
             "xesam:album": self.disc.album,
             "xesam:trackNumber": self.number,
         }
         if self.disc.artist:
             metadata["xesam:artist"] = [self.disc.artist]
             metadata["xesam:albumArtist"] = [self.disc.artist]
-        # Cache-only: never download from the polling path.  CoverLoader
-        # fetches once in the background and a later publish picks it up.
+        # Cache-only: never download from this path.  CoverLoader fetches once
+        # in the background and a later publish picks it up.
         cover = self.disc.cover_cached()
         if cover:
             metadata["mpris:artUrl"] = "file://" + cover
@@ -701,16 +1096,6 @@ class PlayerService(QtCore.QObject):
         QDBusConnection.sessionBus().send(message)
 
 
-def QtDBusObjectPath(path: str):
-    """QDBusObjectPath moved around between PyQt builds; degrade to a string."""
-    try:
-        from PyQt6.QtDBus import QDBusObjectPath as _Path
-
-        return _Path(path)
-    except Exception:
-        return path
-
-
 # --------------------------------------------------------------------------
 # Window
 # --------------------------------------------------------------------------
@@ -722,17 +1107,31 @@ QLabel#album { color: #a8a9ad; }
 QLabel#clock { color: #8d8e93; font-size: 11px; }
 QPushButton {
     background: #23252b; border: none; border-radius: 6px;
-    padding: 7px 12px; color: #e8e8ea; font-size: 15px;
+    padding: 6px 10px; color: #e8e8ea; font-size: 15px;
 }
 QPushButton:hover { background: #2e3138; }
-QPushButton:pressed { background: #3a3e47; }
+QPushButton:disabled { color: #5a5c63; background: #1d1f24; }
 QPushButton#primary { background: #2f6df6; }
 QPushButton#primary:hover { background: #4780ff; }
+QPushButton#primary:disabled { background: #24334f; color: #8b97b5; }
+
+/* The click has been consumed: the glyph sinks into the button.  Padding
+   grows inside a fixed size, so nothing in the layout moves. */
+QPushButton[sunk="true"] {
+    background: #14151a; padding: 9px 13px; font-size: 13px; color: #b9bac0;
+}
+QPushButton#primary[sunk="true"] { background: #1d47a8; color: #dfe7ff; }
+
+/* Sent, not yet confirmed by playback. */
+QPushButton[pending="true"] { background: #2b2f3a; color: #cfd0d6; }
+QPushButton#primary[pending="true"] { background: #27529f; }
+
 QListWidget {
     background: #1c1e23; border: none; border-radius: 6px;
     outline: none; font-size: 12px;
 }
 QListWidget::item { padding: 4px 7px; border-radius: 4px; }
+QListWidget::item:hover { background: #262a33; }
 QListWidget::item:selected { background: #2f6df6; }
 QProgressBar {
     background: #23252b; border: none; border-radius: 2px;
@@ -740,6 +1139,96 @@ QProgressBar {
 }
 QProgressBar::chunk { background: #2f6df6; border-radius: 2px; }
 """
+
+# Spinner frames for the "spinning up" state: a disc that is being read.
+SPINNER = ("\u25f4", "\u25f7", "\u25f6", "\u25f5")
+
+GLYPH_PREV = "\u23ee"
+GLYPH_NEXT = "\u23ed"
+GLYPH_PLAY = "\u25b6"
+GLYPH_PAUSE = "\u23f8"
+GLYPH_EJECT = "\u23cf"
+
+
+class SinkButton(QtWidgets.QPushButton):
+    """A button that visibly swallows each press.
+
+    Two distinct states, because they answer two different questions:
+
+    * sunk (~140ms): "this click was consumed".  Fires on every press, even
+      when ten arrive in a second, so spamming reads as ten acknowledgements
+      rather than one dead button.
+    * pending: "the player has not confirmed it yet".  Stays until playback
+      state catches up, and carries a count when presses are still queued.
+    """
+
+    SINK_MS = 140
+
+    def __init__(self, glyph: str, parent=None) -> None:
+        super().__init__(glyph, parent)
+        self._glyph = glyph
+        self._pending = 0
+        self._sunk = False
+        self._release = QtCore.QTimer(self)
+        self._release.setSingleShot(True)
+        self._release.setInterval(self.SINK_MS)
+        self._release.timeout.connect(self._unsink)
+        self.setProperty("sunk", "false")
+        self.setProperty("pending", "false")
+
+    def set_glyph(self, glyph: str) -> None:
+        if glyph != self._glyph:
+            self._glyph = glyph
+            self._relabel()
+
+    def set_pending(self, count: int) -> None:
+        count = max(0, int(count))
+        if count == self._pending:
+            return
+        self._pending = count
+        self.setProperty("pending", "true" if count else "false")
+        self._restyle()
+        self._relabel()
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        # Sink on press rather than on click, so the feedback lands before
+        # the handler runs and is visible even for a very fast tap.
+        if event.button() == QtCore.Qt.MouseButton.LeftButton and self.isEnabled():
+            self.sink()
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.key() in (
+            QtCore.Qt.Key.Key_Space,
+            QtCore.Qt.Key.Key_Return,
+            QtCore.Qt.Key.Key_Enter,
+        ):
+            self.sink()
+        super().keyPressEvent(event)
+
+    def sink(self) -> None:
+        """Acknowledge one press.  Re-sinks even while already sunk."""
+        self._sunk = True
+        self.setProperty("sunk", "true")
+        self._restyle()
+        self._release.start()
+
+    def _unsink(self) -> None:
+        self._sunk = False
+        self.setProperty("sunk", "false")
+        self._restyle()
+
+    def _relabel(self) -> None:
+        # A count only helps when more than one press is outstanding.
+        if self._pending > 1:
+            self.setText("%s%d" % (self._glyph, self._pending))
+        else:
+            self.setText(self._glyph)
+
+    def _restyle(self) -> None:
+        style = self.style()
+        style.unpolish(self)
+        style.polish(self)
 
 
 class CoverLoader(QtCore.QThread):
@@ -770,9 +1259,12 @@ class Window(QtWidgets.QWidget):
         self.setWindowTitle("Audio CD")
         self.setStyleSheet(STYLE)
         self.setFixedWidth(360)
+        self.setToolTip(
+            "Media keys control this disc. Closing the window keeps them working."
+        )
 
         outer = QtWidgets.QVBoxLayout(self)
-        outer.setContentsMargins(14, 14, 14, 12)
+        outer.setContentsMargins(14, 14, 14, 14)
         outer.setSpacing(10)
 
         header = QtWidgets.QHBoxLayout()
@@ -806,45 +1298,62 @@ class Window(QtWidgets.QWidget):
         self.bar = QtWidgets.QProgressBar()
         self.bar.setTextVisible(False)
         self.bar.setRange(0, 1000)
+        self.bar.setFixedHeight(4)
         outer.addWidget(self.bar)
 
         controls = QtWidgets.QHBoxLayout()
         controls.setSpacing(7)
-        self.prev = QtWidgets.QPushButton("\u23ee")
-        self.toggle = QtWidgets.QPushButton("\u25b6")
+        self.prev = SinkButton(GLYPH_PREV)
+        self.toggle = SinkButton(GLYPH_PLAY)
         self.toggle.setObjectName("primary")
-        self.next = QtWidgets.QPushButton("\u23ed")
-        self.album_button = QtWidgets.QPushButton("Entire album")
-        self.eject = QtWidgets.QPushButton("\u23cf")
-        for widget, slot, tip in (
-            (self.prev, lambda: self.service.skip(-1), "Previous track"),
-            (self.toggle, self.service.toggle, "Play / pause"),
-            (self.next, lambda: self.service.skip(1), "Next track"),
-            (self.album_button, lambda: self.service.start(album=True), "Play the whole disc"),
-            (self.eject, self.do_eject, "Eject"),
+        self.next = SinkButton(GLYPH_NEXT)
+        self.album_button = SinkButton("Entire album")
+        self.eject = SinkButton(GLYPH_EJECT)
+        for widget, slot, tip, width in (
+            (self.prev, lambda: self.service.skip(-1), "Previous track", 44),
+            (self.toggle, self.service.toggle, "Play / pause (Space)", 52),
+            (self.next, lambda: self.service.skip(1), "Next track", 44),
+            (self.album_button, self.play_album, "Play the whole disc", 0),
+            (self.eject, self.service.eject, "Eject", 44),
         ):
             widget.setToolTip(tip)
+            widget.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+            if width:
+                widget.setFixedWidth(width)
+            widget.setFixedHeight(34)
             widget.clicked.connect(slot)
             controls.addWidget(widget)
         outer.addLayout(controls)
 
         self.tracks = QtWidgets.QListWidget()
         self.tracks.setFixedHeight(150)
-        self.tracks.setVerticalScrollBarPolicy(
-            QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        self.tracks.setUniformItemSizes(True)  # cheaper layout while scrolling
+        self.tracks.setVerticalScrollMode(
+            QtWidgets.QAbstractItemView.ScrollMode.ScrollPerPixel
         )
+        self.tracks.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.tracks.setToolTip("Double-click a track to play it")
         for number in range(1, max(disc.total, len(disc.titles)) + 1):
             item = QtWidgets.QListWidgetItem("%2d.  %s" % (number, disc.title(number)))
             item.setData(QtCore.Qt.ItemDataRole.UserRole, number)
             self.tracks.addItem(item)
-        self.tracks.itemActivated.connect(self.play_item)
+        # Double-click and Enter both "use" a row; single click only selects.
         self.tracks.itemDoubleClicked.connect(self.play_item)
+        self.tracks.itemActivated.connect(self.play_item)
         outer.addWidget(self.tracks)
 
-        hint = QtWidgets.QLabel("Media keys control this disc. Closing keeps them working.")
-        hint.setObjectName("clock")
-        hint.setWordWrap(True)
-        outer.addWidget(hint)
+        for keys, slot in (
+            ((QtCore.Qt.Key.Key_Space,), self.press_toggle),
+            ((QtCore.Qt.Key.Key_Right, QtCore.Qt.Key.Key_MediaNext), self.press_next),
+            (
+                (QtCore.Qt.Key.Key_Left, QtCore.Qt.Key.Key_MediaPrevious),
+                self.press_prev,
+            ),
+        ):
+            for key in keys:
+                QtGui.QShortcut(QtGui.QKeySequence(key), self, activated=slot)
 
         self._cover_thread = None
         self.load_cover()
@@ -857,13 +1366,53 @@ class Window(QtWidgets.QWidget):
         if not (disc.album and disc.titles):
             self._meta_timer.start(1500)
 
+        # Only runs while a disc is spinning up, so it costs nothing at rest.
+        self._spin = 0
+        self._spin_timer = QtCore.QTimer(self)
+        self._spin_timer.setInterval(110)
+        self._spin_timer.timeout.connect(self._spin_tick)
+
         service.changed.connect(self.sync)
         self.sync()
 
+    # -- keyboard paths sink the matching button too ----------------------
+    def press_toggle(self) -> None:
+        self.toggle.sink()
+        self.service.toggle()
+
+    def press_next(self) -> None:
+        self.next.sink()
+        self.service.skip(1)
+
+    def press_prev(self) -> None:
+        self.prev.sink()
+        self.service.skip(-1)
+
+    def play_album(self) -> None:
+        if self.service.alive:
+            self.service.play_track(1)
+        else:
+            self.service.start(album=True)
+
+    # -- cover art ---------------------------------------------------------
     def set_cover(self, path: str) -> None:
         pixmap = QtGui.QPixmap(path)
-        if not pixmap.isNull():
-            self.art.setPixmap(pixmap)
+        if pixmap.isNull():
+            return
+        # Scale once here rather than letting the label rescale on every
+        # repaint, and keep it crisp on a HiDPI screen.
+        ratio = self.devicePixelRatioF() or 1.0
+        side = int(72 * ratio)
+        scaled = pixmap.scaled(
+            side,
+            side,
+            QtCore.Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            QtCore.Qt.TransformationMode.SmoothTransformation,
+        )
+        scaled.setDevicePixelRatio(ratio)
+        self.art.setScaledContents(False)
+        self.art.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.art.setPixmap(scaled)
 
     def has_cover(self) -> bool:
         pixmap = self.art.pixmap()
@@ -908,52 +1457,79 @@ class Window(QtWidgets.QWidget):
             item.setData(QtCore.Qt.ItemDataRole.UserRole, number)
             self.tracks.addItem(item)
         for row in range(self.tracks.count()):
-            self.tracks.item(row).setText(
-                "%2d.  %s" % (row + 1, disc.title(row + 1))
-            )
+            label = "%2d.  %s" % (row + 1, disc.title(row + 1))
+            item = self.tracks.item(row)
+            if item.text() != label:  # setText forces a relayout; avoid churn
+                item.setText(label)
 
     def play_item(self, item: QtWidgets.QListWidgetItem) -> None:
         number = item.data(QtCore.Qt.ItemDataRole.UserRole)
         if not number:
             return
-        if self.service.mpv.alive:
-            self.service.mpv.command("set_property", "chapter", int(number) - 1)
-            self.service.refresh()
-        else:
-            self.service.start(track=int(number))
+        self.service.play_track(int(number))
 
-    def do_eject(self) -> None:
-        self.service.stop()
-        subprocess.Popen(
-            ["eject", self.service.disc.device],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+    # -- painting ----------------------------------------------------------
+    def _spin_tick(self) -> None:
+        self._spin = (self._spin + 1) % len(SPINNER)
+        self.toggle.set_glyph(SPINNER[self._spin])
+        self.clock.setText("Spinning up the disc\u2026")
+
+    def tick(self) -> None:
+        """Cheap repaint between state pushes, so the bar keeps moving."""
+        service = self.service
+        if not (service.number and service.track_length):
+            return
+        position = service.live_position()
+        self.clock.setText(
+            "%s / %s" % (fmt_time(position), fmt_time(service.track_length))
         )
+        self.bar.setValue(int(1000 * position / service.track_length))
 
     def sync(self) -> None:
         service = self.service
         disc = service.disc
+        starting = service.starting
         playing = service.playback_status == "Playing"
-        if service.playing_any:
-            service.starting = False
-        starting = getattr(service, "starting", False)
-        self.toggle.setText("\u23f8" if playing else "\u25b6")
+
+        # Show what the user asked for while it is still in flight: the icon
+        # flipping on press, then staying flipped, is the confirmation.
+        shown = service.expected_status or service.playback_status
+        if starting:
+            if not self._spin_timer.isActive():
+                self._spin_timer.start()
+        else:
+            if self._spin_timer.isActive():
+                self._spin_timer.stop()
+            self.toggle.set_glyph(
+                GLYPH_PAUSE if shown == "Playing" else GLYPH_PLAY
+            )
+
+        self.toggle.set_pending(service.pending("toggle") or (1 if starting else 0))
+        skips = service.pending("skip")
+        forward = service.skip_dir >= 0
+        self.next.set_pending(skips if forward else 0)
+        self.prev.set_pending(0 if forward else skips)
+        self.album_button.set_pending(service.pending("track"))
+
+        if service.ejecting:
+            self.title.setText("Ejecting\u2026")
+            self.clock.setText("Stopping playback and opening the tray")
+            self.bar.setRange(0, 0)
+            for widget in (self.prev, self.next, self.toggle, self.album_button):
+                widget.setEnabled(False)
+            return
 
         if service.number:
             self.title.setText(disc.title(service.number))
-            suffix = "Track %d of %d" % (service.number, disc.total or service.number)
+            suffix = "Track %d of %d" % (
+                service.number,
+                disc.total or service.number,
+            )
             self.album.setText(
                 " \u00b7 ".join(x for x in (disc.artist, disc.album, suffix) if x)
             )
-            self.clock.setText(
-                "%s / %s" % (fmt_time(service.position), fmt_time(service.track_length))
-            )
             self.bar.setRange(0, 1000)
-            self.bar.setValue(
-                int(1000 * service.position / service.track_length)
-                if service.track_length
-                else 0
-            )
+            self.tick()
             row = service.number - 1
             if 0 <= row < self.tracks.count() and self.tracks.currentRow() != row:
                 self.tracks.setCurrentRow(row)
@@ -964,21 +1540,22 @@ class Window(QtWidgets.QWidget):
                 or "Insert a disc"
             )
             if starting:
-                self.clock.setText("Starting\u2026 the disc is spinning up")
                 self.bar.setRange(0, 0)  # indeterminate: something IS happening
             else:
                 self.bar.setRange(0, 1000)
+                self.bar.setValue(0)
                 self.clock.setText(
                     "Pick a track, or play the entire album"
                     if (disc.titles or disc.total)
                     else "Reading disc\u2026"
                 )
-            self.bar.setValue(0)
 
+        # Skips need something playing; play and album always work, because
+        # they are how playback starts.
         for widget in (self.prev, self.next):
             widget.setEnabled(service.playing_any)
-        for widget in (self.toggle, self.album_button):
-            widget.setEnabled(not starting)
+        self.toggle.setEnabled(not starting)
+        self.album_button.setEnabled(not starting)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         """Hide, don't quit: the MPRIS service is why the media keys work."""
@@ -1011,14 +1588,23 @@ def main() -> int:
         cd_config.get("mpv_ipc_socket") or os.path.join(runtime_dir(), "mpv-ipc.sock")
     )
 
+    if args.no_window and not (
+        os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")
+    ):
+        # MPRIS-only mode needs no compositor.  Without this Qt aborts with
+        # "no Qt platform plugin could be initialized".
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("Audio CD")
     app.setDesktopFileName("roaring-cd-player")
     app.setQuitOnLastWindowClosed(False)
 
-    print("%s starting for %s" % (time.strftime("%H:%M:%S"), device), flush=True)
+    log("starting for %s" % device)
 
-    service = PlayerService(Disc(device, payload), Mpv(socket_path), config)
+    link = MpvLink(socket_path, device)
+    service = PlayerService(Disc(device, payload), link, config)
+
     owns_mpris = service.register()
     if not owns_mpris:
         # Someone already owns the name.  Ask them to raise themselves, but
@@ -1032,31 +1618,24 @@ def main() -> int:
             1000,
         )
         if reply.type() != QDBusMessage.MessageType.ErrorMessage:
-            print("raised the existing window; exiting", flush=True)
+            log("raised the existing window; exiting")
             return 0
-        print(
+        log(
             "existing MPRIS owner is not responding; opening a window without "
-            "MPRIS (media keys stay with the stale instance until it dies)",
-            flush=True,
+            "MPRIS (media keys stay with the stale instance until it dies)"
         )
 
     if not args.no_window:
         service.window = Window(service)
         service.window.show()
 
-    timer = QtCore.QTimer()
-    timer.timeout.connect(service.refresh)
-
-    def retune() -> None:
-        """1s while playing, 3s while idle -- the window is usually hidden."""
-        wanted = 1000 if service.playback_status == "Playing" else 3000
-        if timer.interval() != wanted:
-            timer.setInterval(wanted)
-
-    service.changed.connect(retune)
-    timer.start(1000)
-    service.refresh()
-    return app.exec()
+    app.aboutToQuit.connect(link.shutdown)
+    link.start()
+    try:
+        return app.exec()
+    finally:
+        link.shutdown()
+        link.wait(1500)
 
 
 if __name__ == "__main__":

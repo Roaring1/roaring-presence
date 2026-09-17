@@ -47,7 +47,10 @@ Keys under `cd`:
 | `poll_seconds` | `3` | Playback poll interval while something is playing. |
 | `idle_poll_seconds` | `6` | Slower poll when nothing is playing. |
 | `kernel_toc_first` | `true` | Read the TOC via ioctl instead of waiting on `cd-info`. |
-| `cdtext_probe_timeout` | `12` | Cap on the CD-Text probe; a busy drive no longer stalls startup. |
+| `kernel_cdtext` | `true` | Read CD-Text via `SG_IO` / `READ TOC` format 5 instead of shelling out to `cd-info`. Set `false` to force the `cd-info` path. |
+| `cdtext_probe_timeout` | `12` | Cap on the `cd-info` CD-Text probe. Only used when `kernel_cdtext` is off or came back empty. |
+| `cd_info_timeout` | `45` | Same: `cd-info` fallback only. |
+| `cd_info_attempts` | `2` | Same: `cd-info` fallback only. |
 | `metadata_grace_seconds` | `2.0` | How long the first publish waits for online metadata before going out without it. |
 | `use_cover_art_archive` | `true` | Fetch cover art from the Cover Art Archive. |
 | `show_progress_bar` | `true` | Publish `timestamps` so Discord draws the bar. |
@@ -86,6 +89,19 @@ what makes the **keyboard media keys** work, along with the KDE panel widget,
 the lock screen, and `playerctl`.  mpv has no MPRIS of its own unless the
 mpv-mpris plugin is installed, so the player provides it and proxies every
 call to mpv over the IPC socket.
+
+Double-click a track (or select it and press Enter) to play it; `Space`,
+`Left` and `Right` work as play/pause and skip.  Every press is acknowledged
+immediately: the button sinks for a moment to show the click was consumed,
+stays dimmed while the command is still unconfirmed, and shows a count when
+several presses are outstanding.  Rapid skips are coalesced into a single
+seek, so spamming skip lands on the track you would expect rather than
+queueing up a backlog.  While a cold drive is spinning up, the play button
+becomes a spinner and the progress bar goes indeterminate.
+
+All mpv IPC and every drive ioctl run on a worker thread, and mpv state
+arrives through `observe_property` rather than polling, so the window never
+blocks on the drive or the socket.
 
 Closing the window does not quit while a disc is playing: the MPRIS service
 stays up so the media keys keep working.  Reopen it from the panel, from the
@@ -128,6 +144,20 @@ transient systemd scope, so restarting the presence service never kills music.
 
 ## Metadata
 
+### Reading the disc
+
+The TOC and CD-Text both come straight from the kernel: an `SG_IO` passthrough
+of `READ TOC/PMA/ATIP` (opcode `0x43`), format 5 for CD-Text. This reads album,
+artist, and per-track titles in well under a second.
+
+`cd-info` is now only a fallback for when `kernel_cdtext` is disabled or the
+drive returns no CD-Text block. That matters because some drives never answer
+`cd-info` at all -- it would sit there until `cd_info_timeout` expired and hand
+back nothing, leaving album and artist as `?`. On those drives the kernel reader
+is the difference between full metadata and none.
+
+### Looking it up
+
 1. Disc ID (MusicBrainz) — exact match when the disc is known.
 2. If the disc ID is unknown, a CD-Text search of MusicBrainz releases, ranked
    by how closely the track count matches the disc.
@@ -138,6 +168,15 @@ All of it runs on a background thread, so presence appears from the kernel TOC
 immediately and upgrades itself (titles, cover art) when the lookup lands. If a
 lookup times out mid-way, whatever was already resolved is kept instead of
 throwing the whole thing away.
+
+MusicBrainz requests are serialised at most one per 1.1s (their published rate
+limit) and retried up to three times on 5xx, 429, and transport errors with
+geometric backoff. A `404` is a real answer -- an unknown disc ID -- and is never
+retried. Without the throttle a burst of disc-id, search, detail, and cover-art
+calls reliably drew back a wall of `503`s.
+
+If the lookup still comes back empty, it is retried in the background 20s, 45s,
+and 120s later, re-probing CD-Text as well whenever the drive is idle.
 
 Titles come from CD-Text, then MusicBrainz, then the filename, then
 `Track N` — so a disc with no metadata at all still shows something sane.
@@ -164,6 +203,14 @@ roaring-cd-presence /dev/sr1 --once --dry-run -v     # print a payload, touch no
 - **No cover art**: some releases simply have none in the Cover Art Archive;
   `cover art lookup skipped: 404` is that, not a bug.
 - **No per-track titles**: the disc had no CD-Text and the MusicBrainz detail
-  fetch timed out. Album, artist, and cover still work; re-insert to retry.
+  fetch timed out. Album, artist, and cover still work; the background retry
+  has another go at 20s, 45s, and 120s.
+- **Album and artist show as `?`**: neither the kernel CD-Text read nor the
+  MusicBrainz disc ID found anything, which is expected for a disc that is
+  pressed without CD-Text and not yet in MusicBrainz. Check the reader itself
+  with `roaring-cd-presence /dev/sr1 --once --dry-run -v` and look for the
+  `CD-Text:` line.
+- **Repeated `503` from MusicBrainz**: you are being rate-limited. The client
+  already paces itself; if you lowered `poll_seconds` a long way, raise it.
 - **Manager exits on its own**: by design, after `idle_exit_seconds` with no
   providers connected. The socket re-activates it.

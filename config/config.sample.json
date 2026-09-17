@@ -28,6 +28,7 @@
     "cd_info_timeout": 45,
     "cd_info_attempts": 2,
     "kernel_toc_first": true,
+    "kernel_cdtext": true,
     "cdtext_probe_timeout": 12,
     "autoplay_prompt": true,
     "progress_drift_seconds": 2.5,

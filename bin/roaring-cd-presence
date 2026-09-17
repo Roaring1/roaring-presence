@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
 import fcntl
 import glob
 import hashlib
@@ -34,6 +35,8 @@ import subprocess
 import sys
 import threading
 import time
+import errno
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -48,9 +51,31 @@ TOCENTRY_STRUCT = "<BBBxIBxxx"  # track, adr|ctrl, format, lba, datamode
 CDINFO_TIMEOUT_DEFAULT = 90.0
 CDINFO_ATTEMPTS_DEFAULT = 3
 CDTEXT_PROBE_TIMEOUT_DEFAULT = 12.0
+# Metadata often fails for reasons that fix themselves within a minute:
+# MusicBrainz was briefly unavailable, or cd-info lost its CD-Text race
+# against a drive that was still spinning up.  Retry on this schedule
+# rather than showing "Track N / Audio CD" until the disc is re-inserted.
+METADATA_RETRY_DELAYS = (20.0, 45.0, 120.0)
 FRAMES_PER_SECOND = 75
 PREGAP_FRAMES = 150
 USER_AGENT = "roaring-presence/1.0 ( https://github.com/roaring )"
+
+# MusicBrainz asks for no more than one request per second per client and
+# answers 503 when that is ignored.  One lookup makes up to five calls in
+# a row, so serialise them through a single gate rather than trusting the
+# retry loop to sort it out.
+MB_MIN_INTERVAL = 1.1
+_MB_GATE = threading.Lock()
+_MB_LAST = [0.0]
+
+
+def throttle_musicbrainz() -> None:
+    """Block until at least MB_MIN_INTERVAL has passed since the last call."""
+    with _MB_GATE:
+        wait = MB_MIN_INTERVAL - (time.monotonic() - _MB_LAST[0])
+        if wait > 0:
+            time.sleep(wait)
+        _MB_LAST[0] = time.monotonic()
 
 CONFIG_PATH = os.path.join(
     os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
@@ -133,6 +158,177 @@ def detect_device() -> str:
     return ""
 
 
+# --------------------------------------------------------------------------
+# CD-Text, straight from the drive
+# --------------------------------------------------------------------------
+SG_IO = 0x2285
+SG_DXFER_FROM_DEV = -3
+GPCMD_READ_TOC_PMA_ATOC = 0x43
+CDTEXT_FORMAT = 5
+CDTEXT_MAX_BYTES = 4 + 18 * 2048
+
+# 0x80 is the title pack and 0x81 the performer pack.  In both, entry 0
+# describes the disc and entry N describes track N.
+CDTEXT_TITLE = 0x80
+CDTEXT_PERFORMER = 0x81
+
+
+class _SgIoHdr(ctypes.Structure):
+    _fields_ = [
+        ("interface_id", ctypes.c_int),
+        ("dxfer_direction", ctypes.c_int),
+        ("cmd_len", ctypes.c_ubyte),
+        ("mx_sb_len", ctypes.c_ubyte),
+        ("iovec_count", ctypes.c_ushort),
+        ("dxfer_len", ctypes.c_uint),
+        ("dxferp", ctypes.c_void_p),
+        ("cmdp", ctypes.c_void_p),
+        ("sbp", ctypes.c_void_p),
+        ("timeout", ctypes.c_uint),
+        ("flags", ctypes.c_uint),
+        ("pack_id", ctypes.c_int),
+        ("usr_ptr", ctypes.c_void_p),
+        ("status", ctypes.c_ubyte),
+        ("masked_status", ctypes.c_ubyte),
+        ("msg_status", ctypes.c_ubyte),
+        ("sb_len_wr", ctypes.c_ubyte),
+        ("host_status", ctypes.c_ushort),
+        ("driver_status", ctypes.c_ushort),
+        ("resid", ctypes.c_int),
+        ("duration", ctypes.c_uint),
+        ("info", ctypes.c_uint),
+    ]
+
+
+def _read_toc_format(fd: int, fmt: int, length: int, timeout_ms: int) -> bytes:
+    """One READ TOC/PMA/ATOC command, returning only the bytes the drive sent."""
+    cdb = struct.pack(
+        ">BBBBBBBHB",
+        GPCMD_READ_TOC_PMA_ATOC,
+        0x02,
+        fmt & 0x0F,
+        0,
+        0,
+        0,
+        0,
+        length,
+        0,
+    )
+    buf = ctypes.create_string_buffer(length)
+    sense = ctypes.create_string_buffer(32)
+    cmd = ctypes.create_string_buffer(cdb, len(cdb))
+    hdr = _SgIoHdr(
+        interface_id=ord("S"),
+        dxfer_direction=SG_DXFER_FROM_DEV,
+        cmd_len=len(cdb),
+        mx_sb_len=32,
+        dxfer_len=length,
+        dxferp=ctypes.cast(buf, ctypes.c_void_p),
+        cmdp=ctypes.cast(cmd, ctypes.c_void_p),
+        sbp=ctypes.cast(sense, ctypes.c_void_p),
+        timeout=timeout_ms,
+    )
+    fcntl.ioctl(fd, SG_IO, hdr)
+    if hdr.status or hdr.host_status:
+        raise OSError(
+            "READ TOC format %d: SCSI status %d, host %d, sense %s"
+            % (fmt, hdr.status, hdr.host_status, sense.raw[:18].hex())
+        )
+    return buf.raw[: max(0, length - hdr.resid)]
+
+
+def _decode_cdtext(data: bytes) -> dict:
+    """Decode CD-Text packs into {pack_type: {track_number: text}}.
+
+    Packs are 18 bytes: type, track, sequence, flags, 12 text bytes, CRC.
+    The text bytes of consecutive packs form one NUL-separated stream whose
+    first entry belongs to the track named by the first pack (0 = the disc).
+    Only language block 0 is read, so a multilingual disc stays in one
+    language instead of interleaving two.
+    """
+    if len(data) < 4:
+        return {}
+    declared = struct.unpack(">H", data[:2])[0] + 2
+    body = data[4 : min(len(data), max(4, declared))]
+
+    streams: dict = {}
+    for index in range(0, len(body) - 17, 18):
+        pack = body[index : index + 18]
+        pack_type, track, flags = pack[0], pack[1], pack[3]
+        if not 0x80 <= pack_type <= 0x8F:
+            continue
+        if (flags >> 4) & 0x07:
+            continue  # a different language block
+        if flags & 0x80:
+            continue  # double-byte text; not worth guessing at
+        entry = streams.setdefault(pack_type, {"first": track, "bytes": b""})
+        entry["bytes"] += pack[4:16]
+
+    fields: dict = {}
+    for pack_type, entry in streams.items():
+        raw = entry["bytes"]
+        chunks = raw.split(b"\x00")
+        if chunks and raw and not raw.endswith(b"\x00"):
+            chunks = chunks[:-1]  # trailing fragment, no terminator yet
+        values: dict = {}
+        previous = None
+        for offset, chunk in enumerate(chunks):
+            number = entry["first"] + offset
+            if chunk == b"\t":
+                # TAB means "same as the previous track".
+                text = previous or ""
+            else:
+                decoded = chunk.decode("latin-1", "replace")
+                text = "".join(c for c in decoded if c >= " ").strip()
+            if text:
+                values[number] = text
+                previous = text
+        if values:
+            fields[pack_type] = values
+    return fields
+
+
+def read_cdtext_ioctl(device: str, timeout_ms: int = 5000) -> dict:
+    """CD-Text for a disc, read directly from the drive.
+
+    An empty result means the disc genuinely carries no CD-Text, which the
+    drive reports immediately, so presence never waits on it.  Raises OSError
+    when the drive refuses the command, leaving the caller free to fall back
+    to cd-info.
+    """
+    fd = os.open(device, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        header = _read_toc_format(fd, CDTEXT_FORMAT, 4, timeout_ms)
+        if len(header) < 4:
+            raise OSError("short CD-Text header (%d bytes)" % len(header))
+        length = struct.unpack(">H", header[:2])[0] + 2
+        if length <= 4:
+            return {"album": None, "artist": None, "titles": {}, "performers": {}}
+        data = _read_toc_format(
+            fd, CDTEXT_FORMAT, min(length, CDTEXT_MAX_BYTES), timeout_ms
+        )
+    finally:
+        os.close(fd)
+
+    fields = _decode_cdtext(data)
+    titles = dict(fields.get(CDTEXT_TITLE) or {})
+    performers = dict(fields.get(CDTEXT_PERFORMER) or {})
+    album = titles.pop(0, None)
+    artist = performers.pop(0, None)
+    if not artist and performers:
+        # Some discs tag only the tracks.  One performer repeated across the
+        # whole disc is the album artist for our purposes.
+        unique = set(performers.values())
+        if len(unique) == 1:
+            artist = next(iter(unique))
+    return {
+        "album": album,
+        "artist": artist,
+        "titles": titles,
+        "performers": performers,
+    }
+
+
 def read_disc(
     device: str,
     timeout: float = CDINFO_TIMEOUT_DEFAULT,
@@ -140,6 +336,7 @@ def read_disc(
     kernel_first: bool = True,
     cdtext_timeout: float = CDTEXT_PROBE_TIMEOUT_DEFAULT,
     on_kernel_toc=None,
+    kernel_cdtext: bool = True,
 ) -> dict:
     """CD-Text + TOC, entirely offline, via libcdio's cd-info.
 
@@ -161,6 +358,37 @@ def read_disc(
                 on_kernel_toc(kernel)
             except Exception as exc:  # noqa: BLE001 - never block the TOC read
                 log.warning("early prompt failed: %s", exc)
+
+    # CD-Text, straight from the drive.  cd-info shells out to libcdio
+    # and on some drives takes tens of seconds or never answers at all,
+    # and its timeout leaves the disc with no titles, no album and no
+    # cover art.  One SCSI command returns the same data in a couple of
+    # seconds, and says so immediately when a disc has no CD-Text.
+    if kernel_cdtext and kernel.get("toc"):
+        try:
+            text = read_cdtext_ioctl(device)
+        except OSError as exc:
+            log.info("kernel CD-Text unavailable (%s); trying cd-info", exc)
+        else:
+            if text.get("album") or text.get("titles"):
+                log.info(
+                    "CD-Text: %s - %s (%d track titles)",
+                    text.get("artist") or "?",
+                    text.get("album") or "?",
+                    len(text.get("titles") or {}),
+                )
+            else:
+                log.info("CD-Text: this disc carries none")
+            # TOC and CD-Text are both in hand, so cd-info -- the
+            # slowest part of startup by far -- has nothing to add.
+            return {
+                "album": text.get("album"),
+                "artist": text.get("artist"),
+                "titles": text.get("titles") or {},
+                "performers": text.get("performers") or {},
+                "toc": kernel["toc"],
+                "leadout": kernel["leadout"],
+            }
 
     out = ""
     for attempt in range(1, max(1, int(attempts)) + 1):
@@ -260,10 +488,38 @@ def musicbrainz_discid(toc: dict, leadout: int) -> str:
     )
 
 
-def http_json(url: str, timeout: float = 15.0):
+def http_json(url: str, timeout: float = 15.0, attempts: int = 3):
+    """GET JSON, retrying only the failures that are worth retrying.
+
+    MusicBrainz answers 503 when it is busy or rate-limiting, and 429
+    when a client is too eager.  A single 503 used to throw the whole
+    lookup away, leaving the disc as "track / Audio CD" with no cover for
+    as long as it stayed in the drive.  A 404 is a real answer (the disc
+    is unknown) and is never retried.
+    """
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read())
+    last = None
+    attempts = max(1, int(attempts))
+    metered = "musicbrainz.org" in url
+    for attempt in range(1, attempts + 1):
+        if metered:
+            throttle_musicbrainz()
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            if exc.code < 500 and exc.code != 429:
+                raise
+            last = exc
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            last = exc
+        if attempt < attempts:
+            # A 503 means "slow down", so back off geometrically rather
+            # than knocking again almost immediately.
+            delay = min(2.0 * (2 ** (attempt - 1)), 12.0)
+            log.info("%s; retrying in %.1fs", last, delay)
+            time.sleep(delay)
+    raise last
 
 
 def mb_release_details(release_id: str) -> dict:
@@ -636,11 +892,18 @@ def track_at_position(toc: dict, seconds: float) -> int:
     return current
 
 
+GONE_ERRNOS = (errno.ENOENT, errno.ENODEV, errno.ENXIO)
+
+
 def drive_status(device: str) -> int:
     try:
         fd = os.open(device, os.O_RDONLY | os.O_NONBLOCK)
-    except OSError:
-        return CDS_NO_DISC
+    except OSError as exc:
+        # Only a device that is really gone counts as "no disc".  A drive
+        # that is spinning up (ENOMEDIUM) or held by another reader
+        # (EBUSY) is merely not ready yet, and reporting it as empty is
+        # what made the provider give up seconds after an insert.
+        return CDS_NO_DISC if exc.errno in GONE_ERRNOS else CDS_DRIVE_NOT_READY
     try:
         return fcntl.ioctl(fd, CDROM_DRIVE_STATUS, 0)
     except OSError:
@@ -1171,6 +1434,7 @@ def main(argv: list) -> int:
         bool(cd_cfg.get("kernel_toc_first", True)),
         float(cd_cfg.get("cdtext_probe_timeout", CDTEXT_PROBE_TIMEOUT_DEFAULT)),
         on_kernel_toc=early_prompt,
+        kernel_cdtext=bool(cd_cfg.get("kernel_cdtext", True)),
     )
     if not disc.get("toc"):
         log.error("no audio tracks found on %s", device)
@@ -1196,15 +1460,63 @@ def main(argv: list) -> int:
         "mb_artist": None,
     }
 
-    def resolve_meta_async() -> None:
+    def resolve_once() -> bool:
+        """One attempt.  True once the disc is described well enough."""
         try:
             resolved = resolve_metadata(
                 disc, bool(cd_cfg.get("use_cover_art_archive", True))
             )
         except Exception as exc:  # noqa: BLE001 - never kill presence over metadata
             log.info("metadata lookup failed: %s", exc)
+            return False
+        if resolved:
+            meta.update(resolved)
+        return bool(
+            meta.get("mb_titles") or meta.get("cover") or meta.get("release_id")
+        )
+
+    def reprobe_cdtext() -> None:
+        """Ask the now-idle drive for the CD-Text that cd-info missed.
+
+        Without an album title the MusicBrainz search fallback cannot even
+        run, so a disc whose Disc ID is unknown has nothing left to show.
+        """
+        if disc.get("album") or disc.get("titles"):
             return
-        meta.update(resolved or {})
+        if find_playing_paths():
+            # The drive is streaming audio; cd-info would only fight it.
+            return
+        full_timeout = float(
+            cd_cfg.get("cd_info_timeout", CDINFO_TIMEOUT_DEFAULT)
+        )
+        probe = read_disc(
+            device, full_timeout, 1, True, full_timeout, kernel_cdtext=True
+        )
+        for key in ("album", "artist", "titles", "performers"):
+            if probe.get(key):
+                disc[key] = probe[key]
+        if disc.get("album"):
+            log.info(
+                "CD-Text arrived on retry: %s - %s",
+                disc.get("artist") or "?",
+                disc.get("album"),
+            )
+
+    def resolve_meta_async() -> None:
+        if resolve_once():
+            return
+        for delay in METADATA_RETRY_DELAYS:
+            time.sleep(delay)
+            if drive_status(device) not in (CDS_DISC_OK, CDS_DRIVE_NOT_READY):
+                return  # ejected; nothing left to describe
+            try:
+                reprobe_cdtext()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("CD-Text re-probe failed: %s", exc)
+            if resolve_once():
+                log.info("metadata resolved on retry")
+                return
+        log.info("metadata still unresolved; leaving the disc as-is")
 
     metadata_thread = threading.Thread(
         target=resolve_meta_async, name="metadata", daemon=True
@@ -1288,8 +1600,12 @@ def main(argv: list) -> int:
                 time.sleep(min(1.0, max(0.05, remaining)))
                 status = drive_status(device)
                 if status in (CDS_NO_DISC, CDS_TRAY_OPEN):
-                    ejected = status
-                    break
+                    # Confirm it: one bad reading from a drive that is
+                    # re-seating or re-enumerating is not an eject.
+                    time.sleep(0.4)
+                    if drive_status(device) in (CDS_NO_DISC, CDS_TRAY_OPEN):
+                        ejected = status
+                        break
 
             if ejected is not None:
                 log.info(
