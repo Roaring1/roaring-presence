@@ -1,0 +1,510 @@
+#!/usr/bin/env python3
+"""roaring-presenced -- event-driven Discord Rich Presence manager.
+
+Owns the single Discord IPC connection.  Providers (CD, Minecraft, ...) connect to
+  $XDG_RUNTIME_DIR/roaring-presence.sock
+and push newline-delimited JSON:
+
+  {"provider": "cd", "priority": 50, "activity": {...discord activity...}}
+  {"provider": "cd", "activity": null}    # stay connected, clear my activity
+  {"cmd": "status"}                        # -> one JSON line reply
+  {"cmd": "ping"}                          # -> {"ok": true}
+
+The highest-priority live activity wins.  When the last provider disconnects the
+status is cleared; after `idle_exit_seconds` with nothing connected the manager
+exits, so nothing is resident while nothing is happening.  systemd socket
+activation brings it back on the next provider connect.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import selectors
+import socket
+import struct
+import sys
+import time
+import uuid
+
+OP_HANDSHAKE, OP_FRAME, OP_CLOSE, OP_PING, OP_PONG = 0, 1, 2, 3, 4
+SD_LISTEN_FDS_START = 3
+
+CONFIG_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "roaring-presence",
+    "config.json",
+)
+
+DEFAULT_CONFIG = {
+    "client_id": "",
+    "ipc_socket_candidates": [
+        "$XDG_RUNTIME_DIR/.flatpak/dev.vencord.Vesktop/xdg-run/discord-ipc-{i}",
+        "$XDG_RUNTIME_DIR/app/com.discordapp.Discord/discord-ipc-{i}",
+        "$XDG_RUNTIME_DIR/app/dev.vencord.Vesktop/discord-ipc-{i}",
+        "$XDG_RUNTIME_DIR/discord-ipc-{i}",
+        "/tmp/discord-ipc-{i}",
+    ],
+    "idle_exit_seconds": 300,
+    "priorities": {"cd": 50, "minecraft": 10},
+    "log_level": "info",
+}
+
+log = logging.getLogger("presenced")
+
+
+def runtime_dir() -> str:
+    return os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+
+
+def expand(path: str) -> str:
+    return os.path.expanduser(path.replace("$XDG_RUNTIME_DIR", runtime_dir()))
+
+
+def load_config() -> dict:
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            cfg.update(json.load(fh))
+    except FileNotFoundError:
+        log.warning("no config at %s; using defaults", CONFIG_PATH)
+    except Exception as exc:  # noqa: BLE001 - never die on a bad config
+        log.error("unreadable config %s: %s", CONFIG_PATH, exc)
+    return cfg
+
+
+class DiscordIPC:
+    """A single Discord RPC connection with candidate discovery and backoff."""
+
+    def __init__(self, client_id: str, candidates: list) -> None:
+        self.client_id = client_id
+        self.candidates = candidates
+        self.sock = None
+        self.path = None
+        self.user = None
+        self._rx = b""
+        self._fails = 0
+        self._next_attempt = 0.0
+
+    # ---- framing -----------------------------------------------------
+    @staticmethod
+    def _frame(op: int, obj) -> bytes:
+        payload = json.dumps(obj).encode("utf-8")
+        return struct.pack("<II", op, len(payload)) + payload
+
+    @staticmethod
+    def _read_one(sock) -> tuple:
+        head = b""
+        while len(head) < 8:
+            chunk = sock.recv(8 - len(head))
+            if not chunk:
+                return None, None
+            head += chunk
+        op, length = struct.unpack("<II", head)
+        body = b""
+        while len(body) < length:
+            chunk = sock.recv(length - len(body))
+            if not chunk:
+                return None, None
+            body += chunk
+        try:
+            return op, json.loads(body or b"{}")
+        except ValueError:
+            return op, {}
+
+    # ---- lifecycle ---------------------------------------------------
+    def connected(self) -> bool:
+        return self.sock is not None
+
+    def attempt_due(self) -> bool:
+        return time.monotonic() >= self._next_attempt
+
+    def _backoff(self) -> None:
+        self._fails = min(self._fails + 1, 6)
+        delay = min(2 ** self._fails, 60)
+        self._next_attempt = time.monotonic() + delay
+        log.debug("next discord connect attempt in %ss", delay)
+
+    def _paths(self):
+        for template in self.candidates:
+            for i in range(10):
+                yield expand(template).replace("{i}", str(i))
+
+    def connect(self) -> bool:
+        if not self.client_id:
+            log.error("client_id is empty -- set it in %s", CONFIG_PATH)
+            self._next_attempt = time.monotonic() + 60
+            return False
+        for path in self._paths():
+            if not os.path.exists(path):
+                continue
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(4.0)
+            try:
+                sock.connect(path)
+                sock.sendall(self._frame(OP_HANDSHAKE, {"v": 1, "client_id": self.client_id}))
+                op, data = self._read_one(sock)
+            except OSError as exc:
+                log.debug("skip %s: %s", path, exc)
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                continue
+            if op is None or (data or {}).get("evt") != "READY":
+                log.debug("no READY from %s (op=%s)", path, op)
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                continue
+            sock.setblocking(False)
+            self.sock, self.path, self._rx, self._fails = sock, path, b"", 0
+            self.user = (((data or {}).get("data") or {}).get("user") or {}).get("username")
+            log.info("discord connected via %s (user=%s)", path, self.user)
+            return True
+        log.info("no reachable discord-ipc socket")
+        self._backoff()
+        return False
+
+    def drop(self) -> None:
+        if self.sock is not None:
+            log.info("discord connection dropped (%s)", self.path)
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+        self.path = None
+        self.user = None
+        self._rx = b""
+        self._backoff()
+
+    def fileno(self) -> int:
+        return self.sock.fileno()
+
+    # ---- io ----------------------------------------------------------
+    def send_activity(self, activity) -> bool:
+        if self.sock is None:
+            return False
+        frame = {
+            "cmd": "SET_ACTIVITY",
+            "args": {"pid": os.getpid(), "activity": activity},
+            "nonce": str(uuid.uuid4()),
+        }
+        try:
+            self.sock.sendall(self._frame(OP_FRAME, frame))
+            return True
+        except OSError as exc:
+            log.warning("discord send failed: %s", exc)
+            self.drop()
+            return False
+
+    def on_readable(self) -> None:
+        """Drain whatever Discord sent us; answer PING, notice CLOSE/EOF."""
+        try:
+            chunk = self.sock.recv(65536)
+        except BlockingIOError:
+            return
+        except OSError as exc:
+            log.warning("discord recv failed: %s", exc)
+            self.drop()
+            return
+        if not chunk:
+            self.drop()
+            return
+        self._rx += chunk
+        while len(self._rx) >= 8:
+            op, length = struct.unpack("<II", self._rx[:8])
+            if len(self._rx) < 8 + length:
+                break
+            body, self._rx = self._rx[8 : 8 + length], self._rx[8 + length :]
+            try:
+                data = json.loads(body or b"{}")
+            except ValueError:
+                data = {}
+            if op == OP_PING:
+                try:
+                    self.sock.sendall(self._frame(OP_PONG, data))
+                except OSError:
+                    self.drop()
+                    return
+            elif op == OP_CLOSE:
+                log.info("discord sent CLOSE: %s", data)
+                self.drop()
+                return
+            elif data.get("evt") == "ERROR":
+                log.warning("discord error frame: %s", data.get("data"))
+            else:
+                log.debug("discord frame op=%s %s", op, str(data)[:200])
+
+
+class Provider:
+    __slots__ = ("conn", "name", "priority", "activity", "buf", "seq")
+
+    def __init__(self, conn, seq: int) -> None:
+        self.conn = conn
+        self.name = "anon-%d" % seq
+        self.priority = 0
+        self.activity = None
+        self.buf = b""
+        self.seq = seq
+
+
+class Manager:
+    def __init__(self, cfg: dict, server: socket.socket) -> None:
+        self.cfg = cfg
+        self.server = server
+        self.sel = selectors.DefaultSelector()
+        self.providers = {}
+        self.discord = DiscordIPC(str(cfg.get("client_id") or ""), cfg["ipc_socket_candidates"])
+        self.published = "__unset__"
+        self.idle_since = time.monotonic()
+        self.idle_limit = float(cfg.get("idle_exit_seconds") or 300)
+        self._seq = 0
+        self._discord_registered = False
+        self.sel.register(self.server, selectors.EVENT_READ, ("server", None))
+
+    # ---- resolution --------------------------------------------------
+    def winner(self):
+        live = [p for p in self.providers.values() if p.activity]
+        if not live:
+            return None
+        live.sort(key=lambda p: (p.priority, p.seq), reverse=True)
+        return live[0]
+
+    def publish(self) -> None:
+        top = self.winner()
+        activity = top.activity if top else None
+        signature = json.dumps(activity, sort_keys=True)
+        if signature == self.published and self.discord.connected():
+            return
+        if activity is None and not self.discord.connected():
+            self.published = signature
+            return
+        if not self.discord.connected():
+            if not self.discord.attempt_due() or not self.discord.connect():
+                return
+            self._register_discord()
+            self.published = "__unset__"
+        if self.discord.send_activity(activity):
+            self.published = signature
+            who = top.name if top else "<cleared>"
+            log.info("published %s: %s", who, str(activity)[:220])
+
+    def _register_discord(self) -> None:
+        if self.discord.connected() and not self._discord_registered:
+            self.sel.register(self.discord.sock, selectors.EVENT_READ, ("discord", None))
+            self._discord_registered = True
+
+    def _unregister_discord(self) -> None:
+        if self._discord_registered:
+            try:
+                self.sel.unregister(self.discord.sock)
+            except (KeyError, ValueError, TypeError):
+                pass
+            self._discord_registered = False
+
+    # ---- provider io -------------------------------------------------
+    def accept(self) -> None:
+        try:
+            conn, _ = self.server.accept()
+        except OSError:
+            return
+        conn.setblocking(False)
+        self._seq += 1
+        prov = Provider(conn, self._seq)
+        self.providers[conn.fileno()] = prov
+        self.sel.register(conn, selectors.EVENT_READ, ("provider", prov))
+        log.info("provider connected (%s), %d live", prov.name, len(self.providers))
+
+    def drop_provider(self, prov: Provider) -> None:
+        try:
+            self.sel.unregister(prov.conn)
+        except (KeyError, ValueError):
+            pass
+        self.providers.pop(prov.conn.fileno(), None)
+        try:
+            prov.conn.close()
+        except OSError:
+            pass
+        log.info("provider gone (%s), %d live", prov.name, len(self.providers))
+        if not self.providers:
+            self.idle_since = time.monotonic()
+        self.publish()
+
+    def reply(self, prov: Provider, obj) -> None:
+        try:
+            prov.conn.sendall((json.dumps(obj) + "\n").encode("utf-8"))
+        except OSError:
+            pass
+
+    def handle_message(self, prov: Provider, msg: dict) -> None:
+        cmd = msg.get("cmd")
+        if cmd == "ping":
+            self.reply(prov, {"ok": True})
+            return
+        if cmd == "status":
+            top = self.winner()
+            self.reply(
+                prov,
+                {
+                    "ok": True,
+                    "discord": {
+                        "connected": self.discord.connected(),
+                        "path": self.discord.path,
+                        "user": self.discord.user,
+                    },
+                    "providers": [
+                        {"name": p.name, "priority": p.priority, "live": bool(p.activity)}
+                        for p in self.providers.values()
+                    ],
+                    "winner": top.name if top else None,
+                },
+            )
+            return
+        if "provider" in msg:
+            prov.name = str(msg["provider"])[:48]
+            default = self.cfg.get("priorities", {}).get(prov.name, 0)
+            try:
+                prov.priority = int(msg.get("priority", default))
+            except (TypeError, ValueError):
+                prov.priority = int(default)
+        if "activity" in msg:
+            activity = msg["activity"]
+            prov.activity = activity if isinstance(activity, dict) else None
+            self.publish()
+
+    def on_provider_readable(self, prov: Provider) -> None:
+        try:
+            chunk = prov.conn.recv(65536)
+        except BlockingIOError:
+            return
+        except OSError:
+            self.drop_provider(prov)
+            return
+        if not chunk:
+            self.drop_provider(prov)
+            return
+        prov.buf += chunk
+        if len(prov.buf) > 262144:
+            log.warning("provider %s flooded; dropping", prov.name)
+            self.drop_provider(prov)
+            return
+        while b"\n" in prov.buf:
+            line, prov.buf = prov.buf.split(b"\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                log.warning("provider %s sent non-JSON", prov.name)
+                continue
+            if isinstance(msg, dict):
+                self.handle_message(prov, msg)
+
+    # ---- main loop ---------------------------------------------------
+    def run(self) -> int:
+        log.info("manager up; idle exit after %.0fs with no providers", self.idle_limit)
+        while True:
+            for key, _ in self.sel.select(timeout=5.0):
+                kind, payload = key.data
+                if kind == "server":
+                    self.accept()
+                elif kind == "provider":
+                    self.on_provider_readable(payload)
+                elif kind == "discord":
+                    self.discord.on_readable()
+                    if not self.discord.connected():
+                        self._unregister_discord()
+                        self.published = "__unset__"
+
+            # a dropped Discord link while something still wants to be shown
+            if self.providers and self.winner() and not self.discord.connected():
+                if self.discord.attempt_due():
+                    self.publish()
+                    self._register_discord()
+
+            if not self.providers:
+                if self.discord.connected() and self.published not in ("null", "__unset__"):
+                    self.publish()
+                if time.monotonic() - self.idle_since >= self.idle_limit:
+                    log.info("idle for %.0fs with no providers; exiting", self.idle_limit)
+                    if self.discord.connected():
+                        self.discord.send_activity(None)
+                        time.sleep(0.2)
+                        self.discord.sock.close()
+                    return 0
+            else:
+                self.idle_since = time.monotonic()
+
+
+def inherited_socket():
+    """Return the systemd socket-activated listener, or None."""
+    if os.environ.get("LISTEN_PID") not in (None, str(os.getpid())):
+        return None
+    try:
+        count = int(os.environ.get("LISTEN_FDS", "0"))
+    except ValueError:
+        return None
+    if count < 1:
+        return None
+    sock = socket.socket(fileno=SD_LISTEN_FDS_START)
+    sock.setblocking(False)
+    log.info("using socket-activated fd %d", SD_LISTEN_FDS_START)
+    return sock
+
+
+def own_socket(path: str) -> socket.socket:
+    try:
+        if os.path.exists(path):
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            probe.settimeout(0.5)
+            try:
+                probe.connect(path)
+                probe.close()
+                raise SystemExit("another roaring-presenced already owns %s" % path)
+            except (ConnectionRefusedError, FileNotFoundError, OSError):
+                pass
+            finally:
+                try:
+                    probe.close()
+                except OSError:
+                    pass
+            os.unlink(path)
+    except FileNotFoundError:
+        pass
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(path)
+    os.chmod(path, 0o600)
+    sock.listen(16)
+    sock.setblocking(False)
+    log.info("listening on %s (standalone)", path)
+    return sock
+
+
+def main(argv: list) -> int:
+    cfg = load_config()
+    level = getattr(logging, str(cfg.get("log_level", "info")).upper(), logging.INFO)
+    if "-v" in argv or "--debug" in argv:
+        level = logging.DEBUG
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stderr,
+    )
+    server = inherited_socket() or own_socket(
+        os.path.join(runtime_dir(), "roaring-presence.sock")
+    )
+    try:
+        return Manager(cfg, server).run()
+    except KeyboardInterrupt:
+        log.info("interrupted")
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

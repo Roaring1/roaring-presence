@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+# roaring-minecraft-presence  v1.0
+"""Minecraft provider for roaring-presenced.
+
+Finds a running Minecraft client on the *host* process table (Java or
+Bedrock) and streams a Rich Presence activity to the manager over
+$XDG_RUNTIME_DIR/roaring-presence.sock. The manager owns the single
+discord-ipc connection and arbitrates providers by priority, so this script
+never speaks to Discord directly.
+
+Replaces roaring_vesktop_minecraft_rpc.py, which opened its own IPC socket
+and therefore could not coexist with any other presence source.
+
+Lifecycle: publishes while the game lives, clears its activity and exits
+when the game exits, which lets the socket-activated manager idle out by
+itself. Safe to launch from a PrismLauncher pre-launch hook, a .desktop
+wrapper, or `systemctl --user start roaring-minecraft-presence`.
+
+Why host-side detection: Vesktop runs in a flatpak sandbox with its own PID
+namespace, so its built-in game detection can never see host processes.
+"""
+
+import argparse
+import json
+import logging
+import os
+import re
+import signal
+import socket
+import sys
+import time
+
+log = logging.getLogger("minecraft-presence")
+
+CONFIG_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "roaring-presence",
+    "config.json",
+)
+
+DEFAULTS = {
+    "poll_seconds": 10,
+    "wait_seconds": 90,
+    "status_display_type": 0,
+    "show_instance": True,
+    "read_logs": True,
+    "show_world": True,
+}
+
+LOG_TAIL_BYTES = 65536
+
+
+def runtime_dir() -> str:
+    return os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+
+
+def expand(path: str) -> str:
+    return os.path.expanduser(os.path.expandvars(path))
+
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+            cfg = json.load(handle)
+    except FileNotFoundError:
+        cfg = {}
+    except (OSError, ValueError) as exc:
+        log.warning("config unreadable (%s); using defaults", exc)
+        cfg = {}
+    merged = dict(DEFAULTS)
+    merged.update(cfg.get("minecraft") or {})
+    cfg["minecraft"] = merged
+    return cfg
+
+
+# --------------------------------------------------------------------------
+# process detection
+# --------------------------------------------------------------------------
+JAVA_ENTRY_RE = re.compile(
+    "|".join(
+        (
+            r"org\.prismlauncher\.EntryPoint",
+            r"org\.multimc\.EntryPoint",
+            r"net\.minecraft\.client\.main\.Main",
+            r"net\.minecraft\.launchwrapper\.Launch",
+            r"cpw\.mods\.bootstraplauncher\.BootstrapLauncher",
+            r"net\.fabricmc\.loader\.impl\.launch\.knot\.KnotClient",
+            r"net\.neoforged\.[\w.]*[Ll]aunch",
+            r"io\.github\.zekerzhayard\.forgewrapper",
+        )
+    )
+)
+# Every real launcher hands the client both of these; catches unknown launchers.
+VANILLA_ARGS_RE = re.compile(r"--assetIndex\b", re.S)
+VANILLA_ARGS2_RE = re.compile(r"--accessToken\b", re.S)
+BEDROCK_RE = re.compile(r"mcpelauncher-client")
+SELF_RE = re.compile(r"roaring-minecraft-presence")
+
+JAR_VERSION_RE = re.compile(r"minecraft-([\w.+-]+?)-client\.jar")
+ARG_VERSION_RE = re.compile(r"--version\s+(\S+)")
+PATH_VERSION_RE = re.compile(r"/versions/([^/\s]+)/")
+INSTANCE_RE = re.compile(r"/instances/([^/\s]+)/")
+GAMEDIR_RE = re.compile(r"--gameDir\s+(\S+)")
+GAMEDIR_FROM_INSTANCE_RE = re.compile(r"(/\S*/instances/[^/\s]+/(?:\.minecraft|minecraft))\b")
+
+LOADERS = (
+    (re.compile(r"neoforge", re.I), "NeoForge"),
+    (re.compile(r"quilt", re.I), "Quilt"),
+    (re.compile(r"fabric", re.I), "Fabric"),
+    (re.compile(r"forge|launchwrapper|cpw\.mods\.fml|fmltweaker", re.I), "Forge"),
+)
+
+
+def _boot_time() -> float:
+    try:
+        with open("/proc/stat", "r", encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("btime"):
+                    return float(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0.0
+
+
+def _iter_processes_proc():
+    """psutil-free fallback: (pid, start_epoch, cmdline) straight from /proc."""
+    boot = _boot_time()
+    ticks = os.sysconf("SC_CLK_TCK") or 100
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % entry, "rb") as handle:
+                raw = handle.read()
+            if not raw:
+                continue
+            full = raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+            with open("/proc/%s/stat" % entry, "rb") as handle:
+                stat = handle.read().decode("utf-8", "replace")
+            fields = stat.rpartition(")")[2].split()
+            start = boot + float(fields[19]) / ticks
+        except (OSError, ValueError, IndexError):
+            continue
+        yield int(entry), start, full
+
+
+def _iter_processes():
+    try:
+        import psutil
+    except ImportError:
+        yield from _iter_processes_proc()
+        return
+    for proc in psutil.process_iter(["pid", "cmdline", "create_time"]):
+        try:
+            cmdline = proc.info["cmdline"]
+            if not cmdline:
+                continue
+            yield proc.info["pid"], proc.info["create_time"], " ".join(cmdline)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+
+def describe(pid: int, start: float, full: str) -> dict:
+    edition = "bedrock" if BEDROCK_RE.search(full) else "java"
+    meta = {"edition": edition, "pid": pid, "start": start}
+    if edition == "bedrock":
+        return meta
+
+    for pattern in (JAR_VERSION_RE, ARG_VERSION_RE, PATH_VERSION_RE):
+        found = pattern.search(full)
+        if found:
+            meta["version"] = found.group(1)
+            break
+
+    found = INSTANCE_RE.search(full)
+    if found:
+        meta["instance"] = found.group(1).replace("_", " ").strip()
+
+    found = GAMEDIR_RE.search(full)
+    if found:
+        meta["game_dir"] = found.group(1).strip('"')
+    else:
+        found = GAMEDIR_FROM_INSTANCE_RE.search(full)
+        if found:
+            meta["game_dir"] = found.group(1)
+
+    for pattern, label in LOADERS:
+        if pattern.search(full):
+            meta["loader"] = label
+            break
+    return meta
+
+
+def find_minecraft():
+    """Oldest live Minecraft client, or None. Cmdline-only: no open_files()."""
+    best = None
+    for pid, start, full in _iter_processes():
+        if SELF_RE.search(full):
+            continue
+        if BEDROCK_RE.search(full):
+            pass
+        elif JAVA_ENTRY_RE.search(full):
+            pass
+        elif VANILLA_ARGS_RE.search(full) and VANILLA_ARGS2_RE.search(full):
+            pass
+        else:
+            continue
+        meta = describe(pid, start, full)
+        if best is None or meta["start"] < best["start"]:
+            best = meta
+    return best
+
+
+# --------------------------------------------------------------------------
+# session detail (server / world) from the instance's own log
+# --------------------------------------------------------------------------
+CONNECTING_RE = re.compile(r"Connecting to ([\w.\-]+)(?:,\s*(\d+))?")
+SINGLEPLAYER_MARKERS = (
+    "Starting integrated minecraft server",
+    "Preparing start region",
+    "Preparing spawn area",
+    "Loading level",
+)
+SESSION_END_MARKERS = (
+    "Stopping worker threads",
+    "Disconnected from server",
+    "Saving and pausing game world",
+    "Stopping singleplayer server",
+)
+
+
+def newest_save(game_dir: str, since: float):
+    saves = os.path.join(game_dir, "saves")
+    try:
+        names = os.listdir(saves)
+    except OSError:
+        return None
+    best = None
+    for name in names:
+        path = os.path.join(saves, name)
+        try:
+            if not os.path.isdir(path):
+                continue
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if best is None or mtime > best[0]:
+            best = (mtime, name)
+    if best is None or best[0] < since - 5:
+        return None
+    return best[1]
+
+
+def read_session(meta: dict, mc_cfg: dict) -> None:
+    """Annotate meta with 'server' or 'world' by tailing logs/latest.log."""
+    meta.pop("server", None)
+    meta.pop("world", None)
+    game_dir = meta.get("game_dir")
+    if not game_dir or not mc_cfg.get("read_logs", True):
+        return
+    path = os.path.join(game_dir, "logs", "latest.log")
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as handle:
+            if size > LOG_TAIL_BYTES:
+                handle.seek(size - LOG_TAIL_BYTES)
+            tail = handle.read().decode("utf-8", "replace")
+    except OSError as exc:
+        log.debug("log unreadable: %s", exc)
+        return
+
+    server, server_at = None, -1
+    for found in CONNECTING_RE.finditer(tail):
+        server, server_at = found.group(1), found.start()
+    single_at = max((tail.rfind(marker) for marker in SINGLEPLAYER_MARKERS), default=-1)
+    ended_at = max((tail.rfind(marker) for marker in SESSION_END_MARKERS), default=-1)
+
+    if server_at > single_at and server_at > ended_at:
+        meta["server"] = server
+    elif single_at > server_at and single_at > ended_at and mc_cfg.get("show_world", True):
+        world = newest_save(game_dir, meta.get("start") or 0.0)
+        if world:
+            meta["world"] = world
+
+
+# --------------------------------------------------------------------------
+# manager link (same wire protocol as roaring-cd-presence)
+# --------------------------------------------------------------------------
+class ManagerLink:
+    def __init__(self, path: str, dry_run: bool = False) -> None:
+        self.path = path
+        self.dry_run = dry_run
+        self.sock = None
+
+    def connect(self, attempts: int = 12) -> bool:
+        if self.dry_run:
+            return True
+        for attempt in range(attempts):
+            try:
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                client.settimeout(5.0)
+                client.connect(self.path)
+                self.sock = client
+                log.info("manager connected (%s)", self.path)
+                return True
+            except OSError as exc:
+                log.debug("manager connect attempt %d: %s", attempt + 1, exc)
+                time.sleep(0.5)
+        log.error("cannot reach manager at %s", self.path)
+        return False
+
+    def send(self, message: dict) -> bool:
+        if self.dry_run:
+            print(json.dumps(message, indent=2))
+            return True
+        if self.sock is None:
+            return False
+        try:
+            self.sock.sendall((json.dumps(message) + "\n").encode("utf-8"))
+            return True
+        except OSError as exc:
+            log.warning("manager send failed: %s", exc)
+            return False
+
+    def close(self) -> None:
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+
+# --------------------------------------------------------------------------
+# activity building
+# --------------------------------------------------------------------------
+def pad(text: str, fallback: str) -> str:
+    text = (text or "").strip()
+    if len(text) < 2:
+        text = fallback
+    return text[:128]
+
+
+def build_activity(meta: dict, cfg: dict) -> dict:
+    mc_cfg = cfg.get("minecraft", {})
+    assets_cfg = cfg.get("assets", {})
+
+    if meta["edition"] == "bedrock":
+        details = "Minecraft: Bedrock Edition"
+    else:
+        version = (meta.get("version") or "").strip()
+        details = "Minecraft %s" % version if version else "Minecraft: Java Edition"
+        if meta.get("loader"):
+            details = "%s \u00b7 %s" % (details, meta["loader"])
+
+    instance = (meta.get("instance") or "").strip()
+    if meta.get("server"):
+        state = "Multiplayer \u00b7 %s" % meta["server"]
+    elif meta.get("world"):
+        state = "Singleplayer \u00b7 %s" % meta["world"]
+    elif instance and mc_cfg.get("show_instance", True):
+        state = instance
+    else:
+        state = "In game"
+    if instance and mc_cfg.get("show_instance", True) and state != instance:
+        large_text = instance
+    else:
+        large_text = details
+
+    return {
+        "type": 0,
+        "name": "Minecraft",
+        "details": pad(details, "Minecraft"),
+        "state": pad(state, "In game"),
+        "status_display_type": int(mc_cfg.get("status_display_type", 0)),
+        "assets": {
+            "large_image": assets_cfg.get("minecraft") or "cube",
+            "large_text": pad(large_text, "Minecraft"),
+        },
+        "timestamps": {"start": int(float(meta.get("start") or time.time()) * 1000)},
+        "instance": False,
+    }
+
+
+def demo_meta() -> dict:
+    """Synthetic session so the chain can be tested without launching a game."""
+    return {
+        "edition": "java",
+        "pid": os.getpid(),
+        "start": time.time() - 1800,
+        "version": "1.7.10",
+        "loader": "Forge",
+        "instance": "GT New Horizons 2.8.4",
+        "world": "Nobara Overworld",
+    }
+
+
+# --------------------------------------------------------------------------
+def main(argv: list) -> int:
+    parser = argparse.ArgumentParser(description="Minecraft provider for roaring-presenced")
+    parser.add_argument("--once", action="store_true", help="publish once and exit")
+    parser.add_argument("--dry-run", action="store_true", help="print payloads, touch nothing")
+    parser.add_argument("--wait", type=float, default=None, help="seconds to wait for the game")
+    parser.add_argument("--poll", type=float, default=None, help="override poll interval")
+    parser.add_argument("--demo", action="store_true", help="synthesise a session (testing)")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args(argv)
+
+    cfg = load_config()
+    mc_cfg = cfg["minecraft"]
+    level = logging.DEBUG if args.verbose else getattr(
+        logging, str(cfg.get("log_level", "info")).upper(), logging.INFO
+    )
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stderr,
+    )
+
+    interval = float(args.poll or mc_cfg.get("poll_seconds", 10) or 10)
+    wait_for = args.wait if args.wait is not None else float(mc_cfg.get("wait_seconds", 90) or 0)
+
+    meta = demo_meta() if args.demo else find_minecraft()
+    if meta is None and wait_for > 0:
+        log.info("waiting up to %.0fs for a Minecraft client", wait_for)
+        deadline = time.monotonic() + wait_for
+        while meta is None and time.monotonic() < deadline:
+            time.sleep(min(2.0, interval))
+            meta = find_minecraft()
+    if meta is None:
+        log.info("no Minecraft client running; nothing to do")
+        return 0
+    log.info(
+        "client: %s pid=%s version=%s instance=%s",
+        meta["edition"],
+        meta["pid"],
+        meta.get("version") or "?",
+        meta.get("instance") or "-",
+    )
+
+    link = ManagerLink(os.path.join(runtime_dir(), "roaring-presence.sock"), args.dry_run)
+    if not link.connect():
+        return 3
+
+    priority = int(cfg.get("priorities", {}).get("minecraft", 10))
+    published = None
+    stopping = []
+
+    def request_stop(signum, _frame) -> None:
+        stopping.append(signum)
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+
+    def push(activity) -> None:
+        link.send({"provider": "minecraft", "priority": priority, "activity": activity})
+
+    try:
+        while True:
+            if not args.demo:
+                read_session(meta, mc_cfg)
+            activity = build_activity(meta, cfg)
+            signature = json.dumps(
+                {k: v for k, v in activity.items() if k != "timestamps"}, sort_keys=True
+            )
+            if signature != published:
+                published = signature
+                log.info("%s | %s", activity["details"], activity["state"])
+                push(activity)
+
+            if args.once:
+                return 0
+
+            waited = 0.0
+            while waited < interval and not stopping:
+                time.sleep(0.5)
+                waited += 0.5
+            if stopping:
+                log.info("signal %s; clearing", stopping[0])
+                break
+
+            if not args.demo:
+                current = find_minecraft()
+                if current is None:
+                    log.info("game exited; clearing")
+                    break
+                meta = current
+    finally:
+        if published is not None:
+            push(None)
+            time.sleep(0.3)
+        link.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

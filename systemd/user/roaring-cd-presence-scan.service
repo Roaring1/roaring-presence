@@ -1,0 +1,14 @@
+[Unit]
+Description=roaring-presence audio CD catch-up scan
+Documentation=file:///home/roaring/.config/roaring-presence/README.md
+After=roaring-presenced.socket
+Wants=roaring-presenced.socket
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/roaring-presence-scan
+Slice=background.slice
+Nice=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,8 @@
+# Optional: fully automatic (zero-click) audio-CD presence.
+# Requires root ONCE:
+#   sudo cp ~/.config/roaring-presence/99-roaring-presence-cd.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload
+# Without this, the KDE Device Notifier action "Show this CD on Discord" does
+# the same job with one click and needs no root at all.
+
+ACTION=="change", KERNEL=="sr[0-9]*", ENV{ID_CDROM_MEDIA_TRACK_COUNT_AUDIO}=="?*", ENV{SYSTEMD_USER_WANTS}+="roaring-cd-presence@%k.service"

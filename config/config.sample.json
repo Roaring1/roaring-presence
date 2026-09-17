@@ -1,0 +1,51 @@
+{
+  "client_id": "1550214663394951234",
+  "ipc_socket_candidates": [
+    "$XDG_RUNTIME_DIR/.flatpak/dev.vencord.Vesktop/xdg-run/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/app/com.discordapp.Discord/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/app/dev.vencord.Vesktop/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/discord-ipc-{i}",
+    "/tmp/discord-ipc-{i}"
+  ],
+  "idle_exit_seconds": 300,
+  "priorities": {
+    "cd": 50,
+    "minecraft": 10
+  },
+  "assets": {
+    "cd": "cd",
+    "play": "play",
+    "pause": "pause",
+    "minecraft": "cube"
+  },
+  "cd": {
+    "device": "auto",
+    "poll_seconds": 3,
+    "status_display_type": 2,
+    "use_cover_art_archive": true,
+    "mpv_ipc_socket": "$XDG_RUNTIME_DIR/mpv-ipc.sock",
+    "show_progress_bar": true,
+    "cd_info_timeout": 45,
+    "cd_info_attempts": 2,
+    "kernel_toc_first": true,
+    "cdtext_probe_timeout": 12,
+    "autoplay_prompt": true,
+    "progress_drift_seconds": 2.5,
+    "idle_poll_seconds": 6,
+    "metadata_grace_seconds": 2.0,
+    "links": {
+      "track": "https://music.youtube.com/search?q=%(query)s",
+      "album": "https://musicbrainz.org/release/%(release_id)s",
+      "album_fallback": "https://music.youtube.com/search?q=%(album_query)s"
+    }
+  },
+  "minecraft": {
+    "poll_seconds": 10,
+    "wait_seconds": 90,
+    "status_display_type": 0,
+    "show_instance": true,
+    "read_logs": true,
+    "show_world": true
+  },
+  "log_level": "info"
+}

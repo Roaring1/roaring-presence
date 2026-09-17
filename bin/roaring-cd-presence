@@ -1,0 +1,1219 @@
+#!/usr/bin/env python3
+"""roaring-cd-presence -- audio-CD provider for roaring-presenced.
+
+Lifecycle is the disc session: started when an audio CD is inserted (KDE Solid
+action or udev), exits when the disc is ejected.  Nothing is left running.
+
+  roaring-cd-presence [/dev/srN] [--once] [--dry-run] [-v]
+
+What it does
+  1. reads CD-Text + TOC offline with cd-info
+  2. computes the exact MusicBrainz Disc ID and (optionally) resolves front
+     cover art from the Cover Art Archive, cached on disk per disc
+  3. connects to the manager socket and publishes a "Listening to ..." activity
+  4. follows playback: current track from the kio-fuse filename, or from the
+     Full-CD wav position mapped through the TOC via mpv's JSON IPC
+  5. on eject: clears the activity, disconnects, exits
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import fcntl
+import glob
+import hashlib
+import json
+import logging
+import os
+import re
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+CDROM_DRIVE_STATUS = 0x5326
+CDS_NO_DISC, CDS_TRAY_OPEN, CDS_DRIVE_NOT_READY, CDS_DISC_OK = 1, 2, 3, 4
+CDROMREADTOCHDR = 0x5305
+CDROMREADTOCENTRY = 0x5306
+CDROM_LEADOUT = 0xAA
+CDROM_LBA = 0x01
+CDROM_DATA_TRACK = 0x04
+TOCENTRY_STRUCT = "<BBBxIBxxx"  # track, adr|ctrl, format, lba, datamode
+CDINFO_TIMEOUT_DEFAULT = 90.0
+CDINFO_ATTEMPTS_DEFAULT = 3
+CDTEXT_PROBE_TIMEOUT_DEFAULT = 12.0
+FRAMES_PER_SECOND = 75
+PREGAP_FRAMES = 150
+USER_AGENT = "roaring-presence/1.0 ( https://github.com/roaring )"
+
+CONFIG_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "roaring-presence",
+    "config.json",
+)
+CACHE_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+    "roaring-presence",
+)
+
+log = logging.getLogger("cd")
+
+
+def runtime_dir() -> str:
+    return os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+
+
+def expand(path: str) -> str:
+    return os.path.expanduser(path.replace("$XDG_RUNTIME_DIR", runtime_dir()))
+
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("config unreadable (%s); using defaults", exc)
+        return {}
+
+
+# --------------------------------------------------------------------------
+# disc reading
+# --------------------------------------------------------------------------
+def read_toc_ioctl(device: str) -> dict:
+    """TOC straight from the kernel, used when cd-info stalls on a busy drive."""
+    toc: dict = {}
+    leadout = None
+    try:
+        fd = os.open(device, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as exc:
+        log.error("cannot open %s: %s", device, exc)
+        return {}
+    try:
+        header = bytearray(2)
+        fcntl.ioctl(fd, CDROMREADTOCHDR, header)
+        first, last = header[0], header[1]
+        for number in list(range(first, last + 1)) + [CDROM_LEADOUT]:
+            entry = bytearray(
+                struct.pack(TOCENTRY_STRUCT, number, 0, CDROM_LBA, 0, 0)
+            )
+            fcntl.ioctl(fd, CDROMREADTOCENTRY, entry)
+            _, adr_ctrl, _, lba, _ = struct.unpack(TOCENTRY_STRUCT, bytes(entry))
+            if number == CDROM_LEADOUT:
+                leadout = lba
+            elif not (adr_ctrl >> 4) & CDROM_DATA_TRACK:
+                toc[number] = lba
+    except OSError as exc:
+        log.warning("kernel TOC read failed on %s: %s", device, exc)
+        return {}
+    finally:
+        os.close(fd)
+    return {
+        "album": None,
+        "artist": None,
+        "titles": {},
+        "performers": {},
+        "toc": toc,
+        "leadout": leadout,
+    }
+
+
+def detect_device() -> str:
+    """First /dev/sr* that actually holds an audio disc."""
+    for candidate in sorted(glob.glob("/dev/sr[0-9]*")):
+        if drive_status(candidate) not in (CDS_DISC_OK, CDS_DRIVE_NOT_READY):
+            continue
+        if read_toc_ioctl(candidate).get("toc"):
+            return candidate
+    return ""
+
+
+def read_disc(
+    device: str,
+    timeout: float = CDINFO_TIMEOUT_DEFAULT,
+    attempts: int = CDINFO_ATTEMPTS_DEFAULT,
+    kernel_first: bool = True,
+    cdtext_timeout: float = CDTEXT_PROBE_TIMEOUT_DEFAULT,
+) -> dict:
+    """CD-Text + TOC, entirely offline, via libcdio's cd-info.
+
+    The drive is frequently busy (KIO audiocd workers, kio-fuse, a playing
+    or ripping mpv), and cd-info then takes far longer than on an idle
+    drive.  So: generous timeout, retries, and a kernel-TOC fallback that
+    never re-probes the drive.
+    """
+    kernel = read_toc_ioctl(device) if kernel_first else {}
+    if kernel.get("toc"):
+        # The TOC is already known, so presence never has to wait on a busy
+        # drive: cd-info only gets a short window to contribute CD-Text.
+        log.info("kernel TOC: %d audio tracks on %s", len(kernel["toc"]), device)
+        timeout = min(float(timeout), float(cdtext_timeout))
+        attempts = 1
+
+    out = ""
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        try:
+            out = subprocess.run(
+                ["cd-info", "-q", "--no-header", "--no-device-info", device],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            ).stdout
+            break
+        except subprocess.TimeoutExpired:
+            log.warning(
+                "cd-info timed out after %.0fs on %s (attempt %d/%d; drive busy?)",
+                timeout,
+                device,
+                attempt,
+                attempts,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            log.error("cd-info failed: %s", exc)
+            break
+        time.sleep(min(5.0 * attempt, 15.0))
+
+    album = artist = None
+    titles: dict = {}
+    performers: dict = {}
+    section = None
+    for line in out.splitlines():
+        head = re.match(r"CD-TEXT for (Disc|Track\s+(\d+))", line)
+        if head:
+            section = "disc" if head.group(1) == "Disc" else int(head.group(2))
+            continue
+        field = re.match(r"\s+(TITLE|PERFORMER):\s*(.+?)\s*$", line)
+        if field and section is not None:
+            key, value = field.group(1), field.group(2)
+            if section == "disc":
+                if key == "TITLE":
+                    album = value
+                else:
+                    artist = value
+            elif key == "TITLE":
+                titles[section] = value
+            else:
+                performers[section] = value
+
+    toc: dict = {}
+    leadout = None
+    for line in out.splitlines():
+        row = re.match(r"\s*(\d+):\s+[0-9:]+\s+(\d+)\s+(\S+)", line)
+        if not row:
+            continue
+        number, lsn, kind = int(row.group(1)), int(row.group(2)), row.group(3)
+        if kind.startswith("leadout"):
+            leadout = lsn
+        elif number < 100 and kind == "audio":
+            toc[number] = lsn
+
+    if not toc:
+        fallback = kernel if kernel.get("toc") else read_toc_ioctl(device)
+        if fallback.get("toc"):
+            log.warning(
+                "cd-info gave no usable TOC; using kernel TOC (%d tracks)",
+                len(fallback["toc"]),
+            )
+            toc = fallback["toc"]
+            leadout = fallback["leadout"]
+
+    return {
+        "album": album,
+        "artist": artist,
+        "titles": titles,
+        "performers": performers,
+        "toc": toc,
+        "leadout": leadout,
+    }
+
+
+def musicbrainz_discid(toc: dict, leadout: int) -> str:
+    """MusicBrainz Disc ID: SHA-1 over first/last track and 100 LBA offsets."""
+    first, last = min(toc), max(toc)
+    offsets = [0] * 100
+    offsets[0] = leadout + PREGAP_FRAMES
+    for number in range(first, last + 1):
+        offsets[number] = toc.get(number, 0) + PREGAP_FRAMES
+    digest = hashlib.sha1()
+    digest.update(b"%02X" % first)
+    digest.update(b"%02X" % last)
+    for offset in offsets:
+        digest.update(b"%08X" % offset)
+    return (
+        base64.b64encode(digest.digest())
+        .replace(b"+", b".")
+        .replace(b"/", b"_")
+        .replace(b"=", b"-")
+        .decode("ascii")
+    )
+
+
+def http_json(url: str, timeout: float = 15.0):
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read())
+
+
+def mb_release_details(release_id: str) -> dict:
+    return http_json(
+        "https://musicbrainz.org/ws/2/release/%s"
+        "?fmt=json&inc=artist-credits+recordings+release-groups" % release_id
+    )
+
+
+def mb_search_release(album: str, artist: str, track_count: int):
+    """Fallback when the exact Disc ID is unknown to MusicBrainz.
+
+    Plenty of pressings are missing by Disc ID even though the album is in the
+    database, and CD-Text usually knows the album and artist.  Track count is a
+    *preference*, never a filter: MusicBrainz often lists a different count
+    than the disc reports (hidden tracks, bonus tracks, data sessions), and an
+    exact "tracks:N" clause silently rejects the correct release.
+    """
+    if not album:
+        return None
+    query = 'release:"%s"' % album.replace('"', " ")
+    if artist:
+        query += ' AND artist:"%s"' % artist.replace('"', " ")
+    payload = http_json(
+        "https://musicbrainz.org/ws/2/release?fmt=json&limit=10&query=%s"
+        % urllib.parse.quote(query)
+    )
+    releases = payload.get("releases") or []
+    if not releases:
+        return None
+
+    def rank(release):
+        counts = [
+            medium.get("track-count")
+            for medium in (release.get("media") or [])
+            if isinstance(medium.get("track-count"), int)
+        ]
+        if track_count and counts:
+            distance = min(abs(count - track_count) for count in counts)
+        else:
+            distance = 99
+        return (distance, -int(release.get("score") or 0))
+
+    best = sorted(releases, key=rank)[0]
+    if not best.get("id"):
+        return None
+    log.info(
+        "search matched %r (score %s, %s tracks listed vs %s on disc)",
+        best.get("title"),
+        best.get("score"),
+        [m.get("track-count") for m in (best.get("media") or [])],
+        track_count,
+    )
+    try:
+        return mb_release_details(best["id"]) or best
+    except Exception as exc:  # noqa: BLE001 - slow MusicBrainz is not a failure
+        # The search hit already carries the album title, artist credit and
+        # release-group, so keep it; only the per-track titles are missing.
+        log.info("release detail lookup failed (%s); using search result", exc)
+        return best
+
+
+def caa_front(kind: str, mbid: str):
+    """Front cover from the Cover Art Archive, for a release or release-group."""
+    if not mbid:
+        return None
+    art = http_json("https://coverartarchive.org/%s/%s" % (kind, mbid))
+    for image in art.get("images") or []:
+        if image.get("front"):
+            url = (image.get("thumbnails") or {}).get("500") or image.get("image")
+            if url:
+                return url.replace("http://", "https://")
+    return None
+
+
+def resolve_metadata(disc: dict, use_caa: bool) -> dict:
+    """Artist / album / track titles / cover art, cached per Disc ID.
+
+    CD-Text is authoritative when present; MusicBrainz fills the gaps.  Lookup
+    order: exact Disc ID, then a CD-Text search, then cover art from the
+    release and finally its release-group (many releases have no art of their
+    own even though the album does).
+    """
+    result = {
+        "discid": None,
+        "release_id": None,
+        "cover": None,
+        "mb_titles": {},
+        "mb_album": None,
+        "mb_artist": None,
+    }
+    if not disc.get("toc") or disc.get("leadout") is None:
+        return result
+
+    discid = musicbrainz_discid(disc["toc"], disc["leadout"])
+    result["discid"] = discid
+    log.info("musicbrainz disc id: %s", discid)
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_file = os.path.join(
+        CACHE_DIR, "disc-%s.v2.json" % re.sub(r"[^A-Za-z0-9._-]", "_", discid)
+    )
+    try:
+        with open(cache_file, "r", encoding="utf-8") as fh:
+            cached = json.load(fh)
+        log.info("metadata cache hit (%s)", os.path.basename(cache_file))
+        cached.setdefault("discid", discid)
+        return cached
+    except Exception:  # noqa: BLE001 - cache miss is normal
+        pass
+
+    if not use_caa:
+        return result
+
+    releases = []
+    try:
+        payload = http_json(
+            "https://musicbrainz.org/ws/2/discid/%s"
+            "?fmt=json&inc=artist-credits+recordings" % discid
+        )
+        releases = payload.get("releases") or []
+    except Exception as exc:  # noqa: BLE001 - offline / unknown disc is fine
+        log.info("musicbrainz disc id lookup skipped: %s", exc)
+
+    album = (disc.get("album") or "").strip().lower()
+    chosen = None
+    for release in releases:
+        if album and (release.get("title") or "").strip().lower() == album:
+            chosen = release
+            break
+    if chosen is None and releases:
+        chosen = releases[0]
+
+    if chosen is None:
+        try:
+            chosen = mb_search_release(
+                disc.get("album"), disc.get("artist"), len(disc.get("toc") or {})
+            )
+            if chosen is not None:
+                log.info("disc id unknown; matched by CD-Text search")
+        except Exception as exc:  # noqa: BLE001
+            log.info("musicbrainz search skipped: %s", exc)
+
+    if chosen is None:
+        log.info("no MusicBrainz match; staying offline")
+        return result
+
+    if not (chosen.get("media") or []) and chosen.get("id"):
+        try:
+            chosen = mb_release_details(chosen["id"]) or chosen
+        except Exception as exc:  # noqa: BLE001
+            log.debug("release detail lookup skipped: %s", exc)
+
+    result["release_id"] = chosen.get("id")
+    result["mb_album"] = (chosen.get("title") or "").strip() or None
+    credited = []
+    for credit in chosen.get("artist-credit") or []:
+        if not isinstance(credit, dict):
+            continue
+        name = credit.get("name") or (credit.get("artist") or {}).get("name") or ""
+        credited.append(name + (credit.get("joinphrase") or ""))
+    result["mb_artist"] = "".join(credited).strip() or None
+
+    for medium in chosen.get("media") or []:
+        for track in medium.get("tracks") or []:
+            try:
+                result["mb_titles"][int(track.get("position"))] = track.get("title")
+            except (TypeError, ValueError):
+                continue
+
+    group = (chosen.get("release-group") or {}).get("id")
+    for kind, mbid in (("release", result["release_id"]), ("release-group", group)):
+        try:
+            cover = caa_front(kind, mbid)
+        except Exception as exc:  # noqa: BLE001
+            log.info("cover art (%s) skipped: %s", kind, exc)
+            continue
+        if cover:
+            result["cover"] = cover
+            log.info("cover art from %s", kind)
+            break
+
+    if result["release_id"] or result["cover"] or result["mb_titles"]:
+        try:
+            with open(cache_file, "w", encoding="utf-8") as fh:
+                json.dump(result, fh)
+        except OSError:
+            pass
+    return result
+
+
+# --------------------------------------------------------------------------
+# playback detection
+# --------------------------------------------------------------------------
+TRACK_IN_NAME = re.compile(r"(?:^|/|\s-\s)(\d{1,2})\s*-\s*[^/]+\.(?:wav|flac|cda|aiff?|mp3)$", re.I)
+PLAYER_NAMES = ("mpv", "vlc", "strawberry", "audacious", "elisa", "clementine", "ffplay", "mpg123")
+
+
+AUDIOCD_PATTERNS = (
+    re.compile(r"^[Tt]rack\s*(?P<track>\d{1,2})(?:\s*[-.]\s*(?P<title>.+))?$"),
+    re.compile(r"^(?P<artist>.+?)\s+-\s+(?P<track>\d{1,2})\s*[-.]\s*(?P<title>.+)$"),
+    re.compile(r"^(?P<track>\d{1,2})\s*[-.]\s*(?P<title>.+)$"),
+    re.compile(r"^(?P<artist>.+?)\s+-\s+(?P<title>.+)$"),
+)
+FULL_DISC_NAMES = ("full cd", "full disc", "whole cd", "audiocd", "cdda")
+
+
+def parse_audiocd_name(path: str) -> dict:
+    """Artist / track / title from a kio-fuse audiocd name or a cdda:// URL.
+
+    KIO percent-encodes each path component, so 156/Silence arrives as
+    "156%2FSilence".  Dolphin also offers several folder layouts per disc:
+    "01 - Title.wav", "Artist - 01 - Title.wav", "Track 01.wav" when the disc
+    has no CD-Text, and a single "Full CD.wav" stream.
+    """
+    out = {"artist": None, "track": None, "title": None, "full_disc": False}
+    raw = (path or "").strip()
+    if raw.startswith("cdda://"):
+        tail = raw[len("cdda://"):].split(":")[0].split("-")[0]
+        out["track"] = int(tail) if tail.isdigit() else None
+        out["full_disc"] = out["track"] is None
+        return out
+
+    base = urllib.parse.unquote(os.path.basename(raw))
+    stem, _ = os.path.splitext(base)
+    stem = stem.strip()
+    if not stem:
+        return out
+    if stem.lower() in FULL_DISC_NAMES:
+        out["full_disc"] = True
+        return out
+
+    for pattern in AUDIOCD_PATTERNS:
+        match = pattern.match(stem)
+        if not match:
+            continue
+        groups = match.groupdict()
+        out["artist"] = (groups.get("artist") or "").strip() or None
+        out["title"] = (groups.get("title") or "").strip() or None
+        try:
+            out["track"] = int(groups["track"]) if groups.get("track") else None
+        except (TypeError, ValueError):
+            out["track"] = None
+        return out
+
+    out["title"] = stem
+    return out
+
+
+def audiocd_mounts() -> list:
+    return glob.glob(os.path.join(runtime_dir(), "kio-fuse-*", "audiocd"))
+
+
+def find_playing_paths() -> list:
+    """Every player holding an audiocd path or cdda:// URL, newest first."""
+    try:
+        import psutil
+    except ImportError:
+        return []
+
+    found = []
+    candidates = []
+    for proc in psutil.process_iter(["name", "cmdline", "create_time"]):
+        try:
+            name = (proc.info.get("name") or "").lower()
+            argv = proc.info.get("cmdline") or []
+            hit = None
+            for arg in argv:
+                if "/audiocd/" in arg or arg.startswith("cdda://"):
+                    hit = arg
+                    break
+            if hit:
+                found.append(
+                    {
+                        "pid": proc.pid,
+                        "path": hit,
+                        "started": proc.info.get("create_time") or 0.0,
+                    }
+                )
+                continue
+            if any(player in name for player in PLAYER_NAMES) or "cdda" in " ".join(argv):
+                candidates.append(proc)
+        except (psutil.Error, TypeError):
+            continue
+
+    if not found:
+        for proc in candidates:
+            try:
+                for handle in proc.open_files():
+                    if "/audiocd/" in handle.path:
+                        found.append(
+                            {
+                                "pid": proc.pid,
+                                "path": handle.path,
+                                "started": proc.create_time(),
+                            }
+                        )
+                        break
+            except (psutil.Error, TypeError):
+                continue
+
+    found.sort(key=lambda item: item["started"], reverse=True)
+    return found
+
+
+def find_playing_path() -> str:
+    players = find_playing_paths()
+    return players[0]["path"] if players else ""
+
+
+def mpv_query(sock_path: str, properties: list, timeout: float = 1.0) -> dict:
+    if not sock_path or not os.path.exists(sock_path):
+        return {}
+    values: dict = {}
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(timeout)
+        client.connect(sock_path)
+        for index, prop in enumerate(properties, start=1):
+            client.sendall(
+                (json.dumps({"command": ["get_property", prop], "request_id": index}) + "\n").encode()
+            )
+        buffer = b""
+        deadline = time.monotonic() + timeout
+        while len(values) < len(properties) and time.monotonic() < deadline:
+            try:
+                chunk = client.recv(65536)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                try:
+                    message = json.loads(line)
+                except ValueError:
+                    continue
+                request_id = message.get("request_id")
+                if isinstance(request_id, int) and 1 <= request_id <= len(properties):
+                    if message.get("error") == "success":
+                        values[properties[request_id - 1]] = message.get("data")
+                    else:
+                        values[properties[request_id - 1]] = None
+        client.close()
+    except OSError as exc:
+        log.debug("mpv ipc unavailable: %s", exc)
+    return values
+
+
+def track_bounds(toc: dict, leadout: int, number: int) -> tuple:
+    """(start_seconds, length_seconds) for a track, from the TOC."""
+    numbers = sorted(toc)
+    start = toc[number] / FRAMES_PER_SECOND
+    following = [n for n in numbers if n > number]
+    end_lsn = toc[following[0]] if following else leadout
+    return start, max(0.0, (end_lsn - toc[number]) / FRAMES_PER_SECOND)
+
+
+def track_at_position(toc: dict, seconds: float) -> int:
+    frames = int(seconds * FRAMES_PER_SECOND)
+    current = min(toc)
+    for number in sorted(toc):
+        if frames >= toc[number]:
+            current = number
+        else:
+            break
+    return current
+
+
+def drive_status(device: str) -> int:
+    try:
+        fd = os.open(device, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return CDS_NO_DISC
+    try:
+        return fcntl.ioctl(fd, CDROM_DRIVE_STATUS, 0)
+    except OSError:
+        return CDS_DRIVE_NOT_READY
+    finally:
+        os.close(fd)
+
+
+# --------------------------------------------------------------------------
+# manager link
+# --------------------------------------------------------------------------
+class ManagerLink:
+    def __init__(self, path: str, dry_run: bool = False) -> None:
+        self.path = path
+        self.dry_run = dry_run
+        self.sock = None
+
+    def connect(self, attempts: int = 12) -> bool:
+        if self.dry_run:
+            return True
+        for attempt in range(attempts):
+            try:
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                client.settimeout(5.0)
+                client.connect(self.path)
+                self.sock = client
+                log.info("manager connected (%s)", self.path)
+                return True
+            except OSError as exc:
+                log.debug("manager connect attempt %d: %s", attempt + 1, exc)
+                time.sleep(0.5)
+        log.error("cannot reach manager at %s", self.path)
+        return False
+
+    def send(self, message: dict) -> bool:
+        if self.dry_run:
+            print(json.dumps(message, indent=2))
+            return True
+        if self.sock is None:
+            return False
+        try:
+            self.sock.sendall((json.dumps(message) + "\n").encode("utf-8"))
+            return True
+        except OSError as exc:
+            log.warning("manager send failed: %s", exc)
+            return False
+
+    def close(self) -> None:
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+
+# --------------------------------------------------------------------------
+# activity building
+# --------------------------------------------------------------------------
+def pad(text: str, fallback: str) -> str:
+    text = (text or "").strip()
+    if len(text) < 2:
+        text = fallback
+    return text[:128]
+
+
+def build_activity(disc: dict, meta: dict, cfg: dict, state: dict) -> dict:
+    cd_cfg = cfg.get("cd", {})
+    assets_cfg = cfg.get("assets", {})
+    total = len(disc.get("toc") or {}) or 1
+    number = state.get("track")
+    titles = disc.get("titles") or {}
+    mb_titles = meta.get("mb_titles") or {}
+
+    album = (
+        (disc.get("album") or "").strip()
+        or (meta.get("mb_album") or "").strip()
+        or "Audio CD"
+    )
+    artist = (
+        (disc.get("artist") or "").strip()
+        or (meta.get("mb_artist") or "").strip()
+        or (state.get("file_artist") or "").strip()
+        or "Unknown Artist"
+    )
+    if number:
+        title = (
+            titles.get(number)
+            or mb_titles.get(number)
+            or mb_titles.get(str(number))
+            or state.get("file_title")
+            or "Track %d" % number
+        )
+    else:
+        title = state.get("file_title") or album
+
+    assets = {"large_text": pad("%s \u2014 Audio CD" % album, "Audio CD")}
+    assets["large_image"] = meta.get("cover") or assets_cfg.get("cd") or "cd"
+    if state.get("playing") is not None:
+        paused = state.get("paused")
+        assets["small_image"] = (
+            assets_cfg.get("pause") if paused else assets_cfg.get("play")
+        ) or ("pause" if paused else "play")
+        assets["small_text"] = "Paused" if paused else "Playing"
+
+    # Discord shows `state` under `details`.  Name the album and say where
+    # on the disc we are, the way a CD player's display would.
+    if number:
+        state_text = "%s \u00b7 Track %d of %d" % (album, number, total)
+    elif state.get("playing"):
+        state_text = "Entire album \u00b7 %d tracks" % total
+    else:
+        state_text = "%d tracks" % total
+
+    activity = {
+        "type": 2,
+        "name": artist,
+        "details": pad(title, "Audio CD"),
+        "state": pad(state_text, "Audio CD"),
+        "status_display_type": int(cd_cfg.get("status_display_type", 2)),
+        "assets": assets,
+        "instance": False,
+    }
+
+    if number:
+        activity["party"] = {
+            "id": "roaring-cd-%s" % (meta.get("discid") or "disc"),
+            "size": [number, total],
+        }
+
+    now = time.time()
+    elapsed = state.get("elapsed")
+    length = state.get("length")
+    if (
+        cd_cfg.get("show_progress_bar", True)
+        and elapsed is not None
+        and length
+        and not state.get("paused")
+    ):
+        start = now - float(elapsed)
+        activity["timestamps"] = {
+            "start": int(start * 1000),
+            "end": int((start + float(length)) * 1000),
+        }
+    elif not state.get("paused"):
+        activity["timestamps"] = {"start": int(state.get("session_start", now) * 1000)}
+
+    # Clickable links, so the status reads like a real player rather than
+    # inert text.  `details_url` hangs off the song line, `state_url` off the
+    # album line.  Both templates are overridable in config under cd.links.
+    links = cd_cfg.get("links", {}) or {}
+    track_template = links.get(
+        "track", "https://music.youtube.com/search?q=%(query)s"
+    )
+    album_template = links.get(
+        "album", "https://musicbrainz.org/release/%(release_id)s"
+    )
+    album_fallback = links.get(
+        "album_fallback", "https://music.youtube.com/search?q=%(album_query)s"
+    )
+
+    fields = {
+        "query": urllib.parse.quote_plus(("%s %s" % (artist, title)).strip()),
+        "album_query": urllib.parse.quote_plus(("%s %s" % (artist, album)).strip()),
+        "release_id": meta.get("release_id") or "",
+        "discid": meta.get("discid") or "",
+    }
+
+    def render(template):
+        if not template:
+            return None
+        try:
+            return template % fields
+        except (KeyError, ValueError, TypeError):
+            return None
+
+    track_url = render(track_template) if number or title else None
+    if meta.get("release_id"):
+        album_url = render(album_template)
+    else:
+        album_url = render(album_fallback)
+
+    if track_url:
+        activity["details_url"] = track_url[:512]
+    if album_url:
+        activity["state_url"] = album_url[:512]
+    return activity
+
+
+def stop_autoplay() -> None:
+    """Stop playback we started ourselves, on eject.
+
+    Only mpv instances reading the raw disc (cdda://) are touched; a player
+    the user started on local files is none of our business.  The transient
+    systemd scopes the autoplay helper creates are stopped too so no empty
+    units are left behind.
+    """
+    try:
+        import psutil  # lazy, exactly like find_playing_paths()
+    except ImportError:
+        psutil = None
+
+    stopped = 0
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]) if psutil else []:
+        try:
+            if (proc.info.get("name") or "") != "mpv":
+                continue
+            cmdline = " ".join(proc.info.get("cmdline") or [])
+            if "cdda://" not in cmdline:
+                continue
+            proc.terminate()
+            stopped += 1
+        except (psutil.Error, TypeError):
+            continue
+    if stopped:
+        log.info("stopped %d autoplay player(s) on eject", stopped)
+
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "--no-legend", "list-units",
+             "roaring-cd-autoplay-*.scope"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+    units = [
+        line.split()[0]
+        for line in result.stdout.splitlines()
+        if line.strip().startswith("roaring-cd-autoplay-")
+    ]
+    if not units:
+        return
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "stop"] + units,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        log.debug("stopped autoplay scopes: %s", ", ".join(units))
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def maybe_prompt_autoplay(device: str, disc: dict, meta: dict) -> None:
+    """Offer to start playback when a disc is inserted and nothing is playing."""
+    helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "roaring-cd-autoplay")
+    if not os.access(helper, os.X_OK):
+        return
+    if find_playing_paths():
+        log.info("a player already has this disc; no autoplay prompt")
+        return
+
+    titles = disc.get("titles") or {}
+    mb_titles = meta.get("mb_titles") or {}
+    tracks = []
+    for number in sorted(disc.get("toc") or {}):
+        tracks.append(
+            {
+                "number": number,
+                "title": titles.get(number)
+                or mb_titles.get(number)
+                or mb_titles.get(str(number))
+                or "Track %d" % number,
+            }
+        )
+    payload = {
+        "device": device,
+        "album": disc.get("album") or meta.get("mb_album"),
+        "artist": disc.get("artist") or meta.get("mb_artist"),
+        "tracks": tracks,
+    }
+    try:
+        subprocess.Popen(
+            [helper, "--json", json.dumps(payload)],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        log.info("autoplay prompt opened")
+    except OSError as exc:
+        log.warning("autoplay prompt failed: %s", exc)
+
+
+def observe_playback(disc: dict, cfg: dict) -> dict:
+    """Current track / pause / position, best effort.
+
+    With more than one player on the disc, the mpv JSON IPC socket belongs to
+    whichever mpv was started with it -- not necessarily the one we detected.
+    Its position is therefore only trusted when mpv reports the same file,
+    otherwise a second or stale mpv paints the previous track's progress bar
+    onto the new track.
+    """
+    cd_cfg = cfg.get("cd", {})
+    toc = disc.get("toc") or {}
+    leadout = disc.get("leadout")
+    observation = {
+        "playing": None,
+        "paused": False,
+        "track": None,
+        "elapsed": None,
+        "length": None,
+        "file_artist": None,
+        "file_title": None,
+    }
+
+    players = find_playing_paths()
+    if not players:
+        return observation
+    observation["playing"] = True
+
+    mpv = mpv_query(
+        expand(str(cd_cfg.get("mpv_ipc_socket") or "")), ["time-pos", "pause", "path"]
+    )
+    mpv_path = mpv.get("path") or ""
+
+    chosen = players[0]
+    matched = None
+    if mpv_path:
+        wanted = urllib.parse.unquote(os.path.basename(mpv_path))
+        for player in players:
+            if urllib.parse.unquote(os.path.basename(player["path"])) == wanted:
+                matched = player
+                break
+    if matched is not None:
+        chosen = matched
+        if mpv.get("pause") is not None:
+            observation["paused"] = bool(mpv["pause"])
+        position = mpv.get("time-pos")
+    else:
+        position = None
+        if mpv_path:
+            log.debug(
+                "ignoring mpv ipc (%s); this disc is played by %s",
+                mpv_path,
+                chosen["path"],
+            )
+    if len(players) > 1:
+        log.debug("%d players on this disc; following pid %s", len(players), chosen["pid"])
+
+    parsed = parse_audiocd_name(chosen["path"])
+    observation["file_artist"] = parsed["artist"]
+    observation["file_title"] = None if parsed["full_disc"] else parsed["title"]
+
+    number = parsed["track"]
+    if number is None and not parsed["full_disc"]:
+        legacy = TRACK_IN_NAME.search(
+            urllib.parse.unquote(os.path.basename(chosen["path"]))
+        )
+        number = int(legacy.group(1)) if legacy else None
+
+    if number is not None and number in toc:
+        observation["track"] = number
+        _, length = track_bounds(toc, leadout, number)
+        observation["length"] = length
+        if isinstance(position, (int, float)):
+            observation["elapsed"] = float(position)
+        return observation
+
+    # Whole-disc stream (Full CD.wav, cdda://): map absolute position via TOC.
+    if isinstance(position, (int, float)) and toc and leadout is not None:
+        number = track_at_position(toc, float(position))
+        start, length = track_bounds(toc, leadout, number)
+        observation["track"] = number
+        observation["length"] = length
+        observation["elapsed"] = max(0.0, float(position) - start)
+        observation["file_title"] = None
+    return observation
+
+
+# --------------------------------------------------------------------------
+class Terminated(Exception):
+    """Raised from the SIGTERM handler so the loop can clear the status."""
+
+
+def install_signal_handlers() -> None:
+    def handler(signum, _frame):
+        raise Terminated("signal %s" % signum)
+
+    for signame in ("SIGTERM", "SIGHUP"):
+        try:
+            signal.signal(getattr(signal, signame), handler)
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
+def main(argv: list) -> int:
+    install_signal_handlers()
+    parser = argparse.ArgumentParser(description="Audio-CD provider for roaring-presenced")
+    parser.add_argument("device", nargs="?", default=None)
+    parser.add_argument("--once", action="store_true", help="publish once and exit")
+    parser.add_argument("--dry-run", action="store_true", help="print payloads, touch nothing")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args(argv)
+
+    cfg = load_config()
+    level = logging.DEBUG if args.verbose else getattr(
+        logging, str(cfg.get("log_level", "info")).upper(), logging.INFO
+    )
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stderr,
+    )
+
+    cd_cfg = cfg.get("cd", {})
+    configured = args.device or cd_cfg.get("device")
+    if configured in (None, "", "auto"):
+        device = detect_device()
+        if not device:
+            log.error("no optical drive with an audio disc found")
+            return 2
+        log.info("auto-detected device: %s", device)
+    else:
+        device = configured
+        if not os.path.exists(device):
+            log.warning("configured device %s is gone; auto-detecting", device)
+            device = detect_device()
+            if not device:
+                log.error("no such device: %s", configured)
+                return 2
+            log.info("using %s instead", device)
+
+    status = drive_status(device)
+    if status not in (CDS_DISC_OK, CDS_DRIVE_NOT_READY):
+        log.info("no disc in %s (status %s); nothing to do", device, status)
+        return 0
+
+    disc = read_disc(
+        device,
+        float(cd_cfg.get("cd_info_timeout", CDINFO_TIMEOUT_DEFAULT)),
+        int(cd_cfg.get("cd_info_attempts", CDINFO_ATTEMPTS_DEFAULT)),
+        bool(cd_cfg.get("kernel_toc_first", True)),
+        float(cd_cfg.get("cdtext_probe_timeout", CDTEXT_PROBE_TIMEOUT_DEFAULT)),
+    )
+    if not disc.get("toc"):
+        log.error("no audio tracks found on %s", device)
+        return 1
+    log.info(
+        "disc: %s - %s (%d tracks)",
+        disc.get("artist") or "?",
+        disc.get("album") or "?",
+        len(disc["toc"]),
+    )
+
+    # MusicBrainz and the Cover Art Archive can take tens of seconds when the
+    # network is slow, and the disc is already fully described by the kernel
+    # TOC plus CD-Text.  Resolve the online metadata in the background so
+    # presence appears immediately and upgrades itself (titles, cover art)
+    # once the lookup lands.
+    meta = {
+        "discid": None,
+        "release_id": None,
+        "cover": None,
+        "mb_titles": {},
+        "mb_album": None,
+        "mb_artist": None,
+    }
+
+    def resolve_meta_async() -> None:
+        try:
+            resolved = resolve_metadata(
+                disc, bool(cd_cfg.get("use_cover_art_archive", True))
+            )
+        except Exception as exc:  # noqa: BLE001 - never kill presence over metadata
+            log.info("metadata lookup failed: %s", exc)
+            return
+        meta.update(resolved or {})
+
+    metadata_thread = threading.Thread(
+        target=resolve_meta_async, name="metadata", daemon=True
+    )
+    metadata_thread.start()
+    # A short grace period: a cache hit or a fast lookup lands here, so the
+    # very first publish already carries titles and cover art.
+    metadata_thread.join(float(cd_cfg.get("metadata_grace_seconds", 2.0)))
+    if meta.get("cover"):
+        log.info("cover art: %s", meta["cover"])
+
+    link = ManagerLink(os.path.join(runtime_dir(), "roaring-presence.sock"), args.dry_run)
+    if not link.connect():
+        return 3
+
+    priority = int(cfg.get("priorities", {}).get("cd", 50))
+    session_start = time.time()
+    published = None
+    interval = float(cd_cfg.get("poll_seconds", 3) or 3)
+    drift_tolerance = float(cd_cfg.get("progress_drift_seconds", 2.5))
+    idle_interval = max(interval, float(cd_cfg.get("idle_poll_seconds", 6)))
+    last_track = object()
+    track_since = session_start
+    last_push = 0.0
+    last_elapsed = None
+
+    def push(activity) -> None:
+        link.send({"provider": "cd", "priority": priority, "activity": activity})
+
+    if cd_cfg.get("autoplay_prompt", True) and not args.dry_run:
+        maybe_prompt_autoplay(device, disc, meta)
+
+    try:
+        while True:
+            state = observe_playback(disc, cfg)
+            now = time.time()
+            if state.get("track") != last_track:
+                # New track: restart the clock instead of inheriting the old
+                # track's start time.
+                last_track = state.get("track")
+                track_since = now
+                last_elapsed = None
+            state["session_start"] = track_since if state.get("track") else session_start
+            activity = build_activity(disc, meta, cfg, state)
+            signature = json.dumps(
+                {k: v for k, v in activity.items() if k != "timestamps"}, sort_keys=True
+            )
+            elapsed = state.get("elapsed")
+            if signature != published:
+                published = signature
+                log.info(
+                    "track %s / %s%s",
+                    state.get("track") or "-",
+                    activity["details"],
+                    " (paused)" if state.get("paused") else "",
+                )
+                push(activity)
+                last_push, last_elapsed = now, elapsed
+            elif elapsed is not None:
+                # Only refresh the progress bar when it actually drifted
+                # (seek, pause, stall) rather than on every poll.
+                expected = None if last_elapsed is None else last_elapsed + (now - last_push)
+                if expected is None or abs(elapsed - expected) > drift_tolerance:
+                    push(activity)
+                    last_push, last_elapsed = now, elapsed
+
+            if args.once:
+                return 0
+
+            # Sleep in short slices so an eject is seen within ~1s instead of
+            # up to a full poll interval later, and back off the polling when
+            # nothing is playing (an idle disc needs no attention).
+            window = interval if state.get("playing") else idle_interval
+            deadline = time.monotonic() + window
+            ejected = None
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(1.0, max(0.05, remaining)))
+                status = drive_status(device)
+                if status in (CDS_NO_DISC, CDS_TRAY_OPEN):
+                    ejected = status
+                    break
+
+            if ejected is not None:
+                log.info(
+                    "disc ejected (status %s); clearing status and stopping playback",
+                    ejected,
+                )
+                push(None)
+                stop_autoplay()
+                time.sleep(0.4)
+                return 0
+    except KeyboardInterrupt:
+        log.info("interrupted; clearing")
+        push(None)
+        time.sleep(0.3)
+        return 0
+    except Terminated:
+        log.info("terminated; clearing")
+        push(None)
+        time.sleep(0.3)
+        return 0
+    finally:
+        link.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

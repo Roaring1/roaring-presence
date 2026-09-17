@@ -1,0 +1,11 @@
+[Unit]
+Description=roaring-presence Discord Rich Presence manager
+Requires=roaring-presenced.socket
+After=roaring-presenced.socket
+
+[Service]
+Type=exec
+ExecStart=/home/roaring/bin/roaring-presenced
+Restart=no
+Slice=background.slice
+Nice=5
