@@ -1,6 +1,6 @@
 [Unit]
 Description=Minecraft presence provider for roaring-presenced
-Documentation=file:///home/roaring/bin/roaring-minecraft-presence
+Documentation=https://github.com/Roaring1/roaring-presence
 After=graphical-session.target
 ConditionPathExists=%h/bin/roaring-minecraft-presence
 

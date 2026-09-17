@@ -1,6 +1,6 @@
 [Unit]
 Description=roaring-presence audio CD catch-up scan
-Documentation=file:///home/roaring/.config/roaring-presence/README.md
+Documentation=https://github.com/Roaring1/roaring-presence
 After=roaring-presenced.socket
 Wants=roaring-presenced.socket
 

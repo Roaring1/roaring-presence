@@ -7,7 +7,7 @@ Wants=roaring-presenced.socket
 
 [Service]
 Type=exec
-ExecStart=/home/roaring/bin/roaring-cd-presence /dev/%I
+ExecStart=%h/bin/roaring-cd-presence /dev/%I
 Restart=on-failure
 RestartSec=10
 Slice=background.slice
