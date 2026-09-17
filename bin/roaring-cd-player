@@ -261,6 +261,22 @@ class Disc:
     def title(self, number: int) -> str:
         return self.titles.get(number) or "Track %d" % number
 
+    def cover_cached(self) -> str | None:
+        """The already-downloaded cover, if any.  Never touches the network."""
+        path = os.path.join(
+            expand(CACHE_DIR), "cover-%s.jpg" % (self.discid or "unknown")
+        )
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return path
+        return None
+
+    def refresh_metadata(self) -> bool:
+        """Re-read the provider's cache; True when something new arrived."""
+        before = (self.album, self.artist, self.cover_url, len(self.titles))
+        if self.discid:
+            self._from_cache()
+        return before != (self.album, self.artist, self.cover_url, len(self.titles))
+
     def cover_path(self) -> str | None:
         """Cover art, cached on disk so we fetch each release only once."""
         if not self.cover_url:
@@ -527,6 +543,8 @@ class PlayerService(QtCore.QObject):
 
     def start(self, album: bool = False, track: int | None = None) -> None:
         """Hand off to the autoplay helper, which owns the mpv invocation."""
+        if getattr(self, "starting", False):
+            return  # already spinning up; do not launch a second mpv
         binary = shutil.which(AUTOPLAY) or expand("~/bin/" + AUTOPLAY)
         argv = [binary, "--device", self.disc.device]
         argv += ["--album"] if album or not track else ["--track", str(track)]
@@ -540,7 +558,19 @@ class PlayerService(QtCore.QObject):
             )
         except OSError:
             return
-        QtCore.QTimer.singleShot(1200, self.refresh)
+        # A CD takes seconds to spin up.  Say so at once, poll harder than
+        # usual until audio appears, and give up the "starting" state so a
+        # failed launch cannot wedge the UI.
+        self.starting = True
+        self.changed.emit()
+        for delay in (400, 900, 1500, 2500, 4000, 6000, 9000):
+            QtCore.QTimer.singleShot(delay, self.refresh)
+        QtCore.QTimer.singleShot(10000, self.clear_starting)
+
+    def clear_starting(self) -> None:
+        if getattr(self, "starting", False):
+            self.starting = False
+            self.changed.emit()
 
     def raise_window(self) -> None:
         if self.window is not None:
@@ -632,7 +662,9 @@ class PlayerService(QtCore.QObject):
         if self.disc.artist:
             metadata["xesam:artist"] = [self.disc.artist]
             metadata["xesam:albumArtist"] = [self.disc.artist]
-        cover = self.disc.cover_path()
+        # Cache-only: never download from the polling path.  CoverLoader
+        # fetches once in the background and a later publish picks it up.
+        cover = self.disc.cover_cached()
         if cover:
             metadata["mpris:artUrl"] = "file://" + cover
         self.metadata = metadata
@@ -708,6 +740,24 @@ QProgressBar {
 }
 QProgressBar::chunk { background: #2f6df6; border-radius: 2px; }
 """
+
+
+class CoverLoader(QtCore.QThread):
+    """Fetch cover art off the UI thread."""
+
+    loaded = QtCore.pyqtSignal(str)
+
+    def __init__(self, disc, parent=None) -> None:
+        super().__init__(parent)
+        self._disc = disc
+
+    def run(self) -> None:
+        try:
+            path = self._disc.cover_path()
+        except Exception:  # noqa: BLE001 - artwork is never worth a crash
+            return
+        if path:
+            self.loaded.emit(path)
 
 
 class Window(QtWidgets.QWidget):
@@ -796,13 +846,71 @@ class Window(QtWidgets.QWidget):
         hint.setWordWrap(True)
         outer.addWidget(hint)
 
-        cover = disc.cover_path()
-        if cover:
-            pixmap = QtGui.QPixmap(cover)
-            if not pixmap.isNull():
-                self.art.setPixmap(pixmap)
+        self._cover_thread = None
+        self.load_cover()
+
+        # The window opens before the online lookup finishes, so whatever is
+        # missing right now is a ghost that upgrades itself in place.
+        self._meta_polls = 0
+        self._meta_timer = QtCore.QTimer(self)
+        self._meta_timer.timeout.connect(self.poll_metadata)
+        if not (disc.album and disc.titles):
+            self._meta_timer.start(1500)
+
         service.changed.connect(self.sync)
         self.sync()
+
+    def set_cover(self, path: str) -> None:
+        pixmap = QtGui.QPixmap(path)
+        if not pixmap.isNull():
+            self.art.setPixmap(pixmap)
+
+    def has_cover(self) -> bool:
+        pixmap = self.art.pixmap()
+        return pixmap is not None and not pixmap.isNull()
+
+    def load_cover(self) -> None:
+        """Disk is instant; the network goes to a thread."""
+        disc = self.service.disc
+        cached = disc.cover_cached()
+        if cached:
+            self.set_cover(cached)
+            return
+        if not disc.cover_url or self._cover_thread is not None:
+            return
+        thread = CoverLoader(disc, self)
+        thread.loaded.connect(self.set_cover)
+        thread.finished.connect(thread.deleteLater)
+        self._cover_thread = thread
+        thread.start()
+
+    def poll_metadata(self) -> None:
+        self._meta_polls += 1
+        if self._meta_polls > 40:  # ~60s, then stop quietly
+            self._meta_timer.stop()
+            return
+        disc = self.service.disc
+        if disc.refresh_metadata():
+            self.relabel_tracks()
+            if not self.has_cover():
+                self._cover_thread = None
+                self.load_cover()
+            self.sync()
+        if disc.album and disc.titles and self.has_cover():
+            self._meta_timer.stop()
+
+    def relabel_tracks(self) -> None:
+        disc = self.service.disc
+        total = max(disc.total, len(disc.titles), self.tracks.count())
+        while self.tracks.count() < total:
+            number = self.tracks.count() + 1
+            item = QtWidgets.QListWidgetItem()
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, number)
+            self.tracks.addItem(item)
+        for row in range(self.tracks.count()):
+            self.tracks.item(row).setText(
+                "%2d.  %s" % (row + 1, disc.title(row + 1))
+            )
 
     def play_item(self, item: QtWidgets.QListWidgetItem) -> None:
         number = item.data(QtCore.Qt.ItemDataRole.UserRole)
@@ -826,6 +934,9 @@ class Window(QtWidgets.QWidget):
         service = self.service
         disc = service.disc
         playing = service.playback_status == "Playing"
+        if service.playing_any:
+            service.starting = False
+        starting = getattr(service, "starting", False)
         self.toggle.setText("\u23f8" if playing else "\u25b6")
 
         if service.number:
@@ -837,6 +948,7 @@ class Window(QtWidgets.QWidget):
             self.clock.setText(
                 "%s / %s" % (fmt_time(service.position), fmt_time(service.track_length))
             )
+            self.bar.setRange(0, 1000)
             self.bar.setValue(
                 int(1000 * service.position / service.track_length)
                 if service.track_length
@@ -851,11 +963,22 @@ class Window(QtWidgets.QWidget):
                 " \u00b7 ".join(x for x in (disc.artist, disc.album) if x)
                 or "Insert a disc"
             )
-            self.clock.setText("Pick a track, or play the entire album")
+            if starting:
+                self.clock.setText("Starting\u2026 the disc is spinning up")
+                self.bar.setRange(0, 0)  # indeterminate: something IS happening
+            else:
+                self.bar.setRange(0, 1000)
+                self.clock.setText(
+                    "Pick a track, or play the entire album"
+                    if (disc.titles or disc.total)
+                    else "Reading disc\u2026"
+                )
             self.bar.setValue(0)
 
         for widget in (self.prev, self.next):
             widget.setEnabled(service.playing_any)
+        for widget in (self.toggle, self.album_button):
+            widget.setEnabled(not starting)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         """Hide, don't quit: the MPRIS service is why the media keys work."""
