@@ -158,5 +158,15 @@ if [[ -n "${SELECTED[audio-cd]:-}" ]]; then
   echo "Optional: one-shot CD catch-up scan at each login:"
   echo "  ./install.sh --enable-login-scan"
 fi
-echo
-echo "Run: roaring-presence-doctor"
+if [[ -n "${SELECTED[core]:-}" || -n "${SELECTED[audio-cd]:-}" || -n "${SELECTED[minecraft]:-}" ]]; then
+  echo
+  echo "Run: roaring-presence-doctor"
+elif [[ -n "${SELECTED[assets]:-}" ]]; then
+  echo
+  echo "Try the asset tools:"
+  echo "  roaring-presence-assets --help"
+  echo "  roaring-presence-art.py --help"
+elif [[ "$REMOVE_LEGACY_BRIDGE" -eq 1 ]]; then
+  echo
+  echo "Legacy bridge cleanup-only mode; no components were installed."
+fi
