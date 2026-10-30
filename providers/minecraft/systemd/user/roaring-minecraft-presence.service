@@ -1,0 +1,15 @@
+[Unit]
+Description=Minecraft presence provider for roaring-presenced
+Documentation=https://github.com/Roaring1/roaring-presence
+After=graphical-session.target
+ConditionPathExists=%h/bin/roaring-minecraft-presence
+
+[Service]
+# Start this from a launcher event (for example PrismLauncher pre-launch).
+# The short --wait window finds the JVM, then pidfd/inotify events track only
+# that game session. No unit is enabled at login.
+Type=exec
+ExecStart=%h/bin/roaring-minecraft-presence --wait 30
+Restart=no
+TimeoutStopSec=10
+Slice=background.slice

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Audio CD
+GenericName=CD Player
+Comment=Play and control the audio CD in the drive
+Exec=roaring-cd-player
+Icon=media-optical-audio
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=cd;audio;disc;music;
+NoDisplay=false
+StartupNotify=false
+StartupWMClass=roaring-cd-player

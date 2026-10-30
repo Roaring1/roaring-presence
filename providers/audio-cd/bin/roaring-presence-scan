@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# roaring-presence-scan - start the audio-CD provider for discs already in a drive.
+#
+# The udev rule only fires on media *insertion*. This covers the gaps:
+#   * a disc that was already in the drive at login,
+#   * a disc that was already in the drive when the rule was installed,
+#   * opening/playing an audio CD (KIO audiocd mount) without a new insert event.
+#
+# Safe to run any time; it skips drives whose provider is already running.
+# Usage: roaring-presence-scan [--force]
+set -u
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
+
+force=0
+[ "${1:-}" = "--force" ] && force=1
+
+shopt -s nullglob
+found=0
+
+for dev in /dev/sr[0-9]*; do
+    kernel=${dev#/dev/}
+    unit="roaring-cd-presence@${kernel}.service"
+
+    tracks=$(udevadm info --query=property --name="$dev" 2>/dev/null \
+             | sed -n 's/^ID_CDROM_MEDIA_TRACK_COUNT_AUDIO=//p')
+
+    if [ -z "${tracks:-}" ] && [ "$force" -eq 0 ]; then
+        continue
+    fi
+    found=1
+
+    if systemctl --user --quiet is-active "$unit" 2>/dev/null; then
+        echo "${kernel}: provider already running"
+        continue
+    fi
+
+    echo "${kernel}: audio disc (${tracks:-unknown} tracks) - starting provider"
+    systemctl --user start --no-block "$unit"
+done
+
+if [ "$found" -eq 0 ]; then
+    echo "no audio disc in any optical drive"
+fi
+exit 0

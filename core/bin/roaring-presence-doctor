@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""Read-only diagnostics for roaring-presence.
+
+The doctor never starts, stops, enables, or changes services. It only reads the
+configuration, checks optional tools and inspects an already-existing manager
+socket (it will not activate a missing socket).
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import os
+import shutil
+import socket
+import stat
+from pathlib import Path
+from typing import Any
+
+CONFIG_PATH = Path(
+    os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+) / "roaring-presence" / "config.json"
+
+
+def runtime_dir() -> Path:
+    return Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+
+
+def add(results: list[dict[str, str]], level: str, area: str, message: str) -> None:
+    results.append({"level": level, "area": area, "message": message})
+
+
+def check_command(results: list[dict[str, str]], name: str, required: bool = False) -> None:
+    found = shutil.which(name)
+    if found:
+        add(results, "ok", "dependencies", f"{name}: {found}")
+    elif required:
+        add(results, "error", "dependencies", f"{name}: not found")
+    else:
+        add(results, "info", "dependencies", f"{name}: not installed (only needed for related features)")
+
+
+def manager_status(results: list[dict[str, str]], query_manager: bool = False) -> None:
+    path = runtime_dir() / "roaring-presence.sock"
+    if not path.exists():
+        add(results, "info", "manager", "manager socket is absent; the socket unit may be stopped or not installed")
+        return
+    try:
+        if not stat.S_ISSOCK(path.stat().st_mode):
+            add(results, "error", "manager", f"{path} exists but is not a Unix socket")
+            return
+        if not query_manager:
+            add(
+                results,
+                "info",
+                "manager",
+                "socket endpoint exists; not contacted to avoid triggering systemd socket activation (use --query-manager to opt in)",
+            )
+            return
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(1.5)
+            client.connect(str(path))
+            client.sendall(b'{"cmd":"status"}\n')
+            response = b""
+            while b"\n" not in response and len(response) < 65536:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+        payload = json.loads(response.split(b"\n", 1)[0])
+        discord = payload.get("discord") or {}
+        providers = payload.get("providers") or []
+        winner = payload.get("winner") or "none"
+        add(
+            results,
+            "ok" if discord.get("connected") else "warning",
+            "manager",
+            f"manager reachable; Discord connected={bool(discord.get('connected'))}; winner={winner}; providers={len(providers)}",
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        add(results, "warning", "manager", f"could not query existing manager socket: {exc}")
+
+
+def run(query_manager: bool = False) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    results: list[dict[str, str]] = []
+    config: dict[str, Any] = {}
+    if not CONFIG_PATH.is_file():
+        add(results, "warning", "config", f"no config at {CONFIG_PATH}; copy config/config.sample.json and set your Discord Application ID")
+    else:
+        try:
+            loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                raise ValueError("top-level JSON value must be an object")
+            config = loaded
+            add(results, "ok", "config", f"valid JSON: {CONFIG_PATH}")
+        except (OSError, ValueError) as exc:
+            add(results, "error", "config", f"cannot read config: {exc}")
+
+    client_id = str(config.get("client_id") or "").strip()
+    if client_id:
+        if client_id.isdigit():
+            add(results, "ok", "config", "Discord Application ID is configured")
+        else:
+            add(results, "warning", "config", "client_id is not numeric; verify that it is the Discord Application ID")
+    else:
+        add(results, "warning", "config", "client_id is empty; presence can be prepared but cannot connect to Discord")
+
+    candidates = config.get("ipc_socket_candidates") or []
+    if isinstance(candidates, list):
+        existing = []
+        for item in candidates:
+            if not isinstance(item, str):
+                continue
+            expanded = os.path.expanduser(os.path.expandvars(item.replace("$XDG_RUNTIME_DIR", str(runtime_dir()))))
+            for index in range(10):
+                path = Path(expanded.replace("{i}", str(index)))
+                if path.exists():
+                    existing.append(path)
+        add(
+            results,
+            "ok" if existing else "info",
+            "discord-ipc",
+            f"found {len(existing)} candidate Discord IPC socket(s)" if existing else "no configured Discord IPC socket found; start Discord/Vesktop before testing presence",
+        )
+    else:
+        add(results, "error", "config", "ipc_socket_candidates must be a JSON array")
+
+    check_command(results, "python3", required=True)
+    check_command(results, "systemctl")
+    check_command(results, "udevadm")
+    check_command(results, "cd-info")
+    check_command(results, "mpv")
+    for module, label, required in (
+        ("PyQt6", "PyQt6 (CD player UI)", False),
+        ("PIL", "Pillow (asset tools)", False),
+    ):
+        available = importlib.util.find_spec(module) is not None
+        add(
+            results,
+            "ok" if available else ("info" if not required else "error"),
+            "dependencies",
+            f"{label}: {'available' if available else 'not installed'}",
+        )
+
+    assets = config.get("assets") or {}
+    if isinstance(assets, dict):
+        for feature, key in assets.items():
+            if not isinstance(key, str) or not key.strip():
+                add(results, "warning", "assets", f"asset key for {feature!r} is empty or invalid")
+            elif len(key) > 100:
+                add(results, "warning", "assets", f"asset key for {feature!r} is longer than 100 characters")
+        add(results, "ok", "assets", f"{len(assets)} configured Discord asset key(s)")
+
+    manager_status(results, query_manager=query_manager)
+    summary = {
+        "checks": len(results),
+        "errors": sum(item["level"] == "error" for item in results),
+        "warnings": sum(item["level"] == "warning" for item in results),
+        "info": sum(item["level"] == "info" for item in results),
+    }
+    return results, summary
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    parser.add_argument(
+        "--query-manager",
+        action="store_true",
+        help="connect to the existing manager socket (may activate its systemd service)",
+    )
+    args = parser.parse_args(argv)
+    results, summary = run(query_manager=args.query_manager)
+    if args.json:
+        print(json.dumps({"summary": summary, "checks": results}, indent=2))
+    else:
+        for item in results:
+            marker = {"ok": "OK", "warning": "WARN", "error": "ERROR", "info": "INFO"}[item["level"]]
+            print(f"{marker:5} {item['area']}: {item['message']}")
+        print(
+            f"\n{summary['checks']} checks · {summary['errors']} errors · "
+            f"{summary['warnings']} warnings · {summary['info']} informational"
+        )
+        print("Read-only: no service or configuration changes were made.")
+    return 1 if summary["errors"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
