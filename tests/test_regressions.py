@@ -564,7 +564,11 @@ class DoctorTests(unittest.TestCase):
             DOCTOR.CONFIG_PATH = config_dir / "config.json"
             DOCTOR.runtime_dir = lambda: Path(tmp) / "runtime"
             try:
-                with mock.patch.object(DOCTOR.socket, "socket", side_effect=AssertionError("socket connected")):
+                with mock.patch.object(DOCTOR.socket, "socket", side_effect=AssertionError("socket connected")), \
+                     mock.patch.object(DOCTOR, "check_command"), \
+                     mock.patch.object(DOCTOR, "python_module_available", return_value=True), \
+                     mock.patch.object(DOCTOR, "mpv_protocols", return_value={"cdda"}), \
+                     mock.patch.object(DOCTOR, "mpv_audio_outputs", return_value={"pulse"}):
                     results, summary = DOCTOR.run()
                 self.assertEqual(summary["errors"], 0)
                 self.assertTrue(any("socket path" in item["message"] or "socket unit" in item["message"] for item in results))
