@@ -8,6 +8,35 @@ require Discord, a Discord Application ID, or the shared presence daemon.
 This repository is a set of installable components, not one opaque desktop
 daemon:
 
+## Quick start
+
+On Fedora/Nobara, install the base audio-CD dependencies first. Add
+`python3-pyqt6` for the full graphical player window and MPRIS controls:
+
+```bash
+sudo dnf install mpv python3-psutil python3-pyqt6
+
+git clone https://github.com/Roaring1/roaring-presence.git
+cd roaring-presence
+./install.sh --component cd-player
+```
+
+With a disc inserted, start it manually (replace `sr0` with your drive):
+
+```bash
+~/.local/bin/roaring-cd-session /dev/sr0
+```
+
+For automatic start on disc insertion, install the optional udev rule printed
+by the installer; it requires one explicit, system-wide administrator action.
+Other distributions and package names are covered in
+[Linux installation](docs/linux-installation.md).
+
+To add Discord Rich Presence later, install the `audio-cd` profile and set the
+Discord Application ID in your user config. The existing CD player remains the
+same feature; Discord publishing is just an additional component.
+
+
 | Component | Job | When it runs |
 | --- | --- | --- |
 | **CD player** | Disc detection, metadata, playback controls, MPRIS/media keys and eject cleanup | Started by an optical-disc event or explicit command; lives for that disc session |
@@ -398,3 +427,17 @@ bridge, remove an enabled copy with:
 ```
 
 See [architecture and lifecycle notes](docs/architecture.md) for the design.
+
+
+## Project information
+
+- [MIT License](LICENSE)
+- [Changelog](CHANGELOG.md)
+- [Support and supported scope](SUPPORT.md)
+- [Third-party notices](THIRD_PARTY_NOTICES.md)
+- [Security policy](SECURITY.md)
+- [Contributing](CONTRIBUTING.md)
+
+The MIT License covers original project code and documentation in this
+repository. External system packages and compatible desktop clients retain
+their own licenses and terms; see [third-party notices](THIRD_PARTY_NOTICES.md).

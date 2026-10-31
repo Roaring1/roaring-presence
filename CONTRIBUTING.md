@@ -1,6 +1,9 @@
 # Contributing
 
-Thanks for helping improve `roaring-presence`. The project is Linux-first and
+Thanks for helping improve `roaring-presence`. Original project code and
+documentation are offered under the [MIT License](LICENSE); dependencies
+retain their own licenses as listed in [third-party notices](THIRD_PARTY_NOTICES.md).
+The project is Linux-first and
 keeps device/event handling in providers while one optional core owns Discord
 IPC. Please keep the standalone audio-CD player useful without the Discord
 core.

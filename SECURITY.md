@@ -12,10 +12,12 @@ filesystem paths, or logs that contain personal information in bug reports.
 
 ## Reporting a vulnerability
 
-Please use GitHub's **Report a vulnerability** action for this repository when
-private vulnerability reporting is available. Do not file an issue containing
-an unpatched vulnerability or exploit details. Include the affected commit,
-component, Linux distribution/release, and a minimal reproduction that excludes
+Use the repository's **Report a vulnerability** action under the GitHub
+Security tab when private vulnerability reporting is enabled. If that action
+is unavailable, contact the repository owner privately through the GitHub
+profile rather than filing a public issue. Do not publish an unpatched
+vulnerability or exploit details. Include the affected commit, component,
+Linux distribution/release, and a minimal reproduction that excludes
 credentials and personal data.
 
 ## Supported security expectations

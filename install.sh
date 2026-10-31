@@ -394,9 +394,22 @@ if [[ "$HAS_CD" -eq 1 ]]; then
     echo "Optional one-shot login catch-up scan: ./install.sh --enable-login-scan"
   fi
 fi
-if [[ -n "${SELECTED[core]:-}" || -n "${SELECTED[audio-cd]:-}" || -n "${SELECTED[minecraft]:-}" ]]; then
+if [[ "$HAS_CD" -eq 1 ]]; then
   echo
-  echo "Run: $BIN_DIR/roaring-presence-doctor"
+  if [[ "$PLAYER_ONLY_CD" -eq 1 ]]; then
+    echo "Check dependencies: $BIN_DIR/roaring-presence-doctor --component cd-player"
+    echo "Start manually (replace sr0 with your drive): $BIN_DIR/roaring-cd-session /dev/sr0"
+  else
+    echo "Check dependencies and Discord IPC: $BIN_DIR/roaring-presence-doctor --component audio-cd"
+    echo "Set your Discord Application ID in: $CONFIG_DIR/config.json"
+  fi
+elif [[ -n "${SELECTED[core]:-}" || -n "${SELECTED[minecraft]:-}" ]]; then
+  echo
+  if [[ -n "${SELECTED[minecraft]:-}" ]]; then
+    echo "Run: $BIN_DIR/roaring-presence-doctor --component minecraft"
+  else
+    echo "Run: $BIN_DIR/roaring-presence-doctor --component core"
+  fi
 fi
 if [[ -x "$BIN_DIR/roaring-presence-update" ]]; then
   echo "Update from the same GitHub branch later with: $BIN_DIR/roaring-presence-update"

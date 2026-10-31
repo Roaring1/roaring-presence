@@ -640,6 +640,20 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class ProjectMetadataTests(unittest.TestCase):
+    def test_mit_license_citation_and_dependency_boundary_are_consistent(self):
+        license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
+        citation = (ROOT / "CITATION.cff").read_text(encoding="utf-8")
+        notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("MIT License", license_text)
+        self.assertIn("Copyright (c) 2026 Roaring", license_text)
+        self.assertIn("Permission is hereby granted", license_text)
+        self.assertIn("license: MIT", citation)
+        self.assertIn("does not relicense them", notices)
+        self.assertIn("[MIT License](LICENSE)", readme)
+
+
 class InstallerSmokeTests(unittest.TestCase):
     def run_installer(self, *args):
         temporary = tempfile.TemporaryDirectory()
@@ -682,6 +696,8 @@ class InstallerSmokeTests(unittest.TestCase):
         self.assertFalse((bin_dir / "roaring-presenced").exists())
         self.assertFalse((config_root / "roaring-presence/config.json").exists())
         self.assertTrue((config_root / "systemd/user/roaring-cd-player@.service").is_file())
+        self.assertIn("roaring-presence-doctor --component cd-player", result.stdout)
+        self.assertIn("roaring-cd-session /dev/sr0", result.stdout)
         self.assertFalse((config_root / "systemd/user/roaring-presenced.socket").exists())
         desktop = (home / ".local/share/applications/roaring-cd-player.desktop").read_text(encoding="utf-8")
         self.assertIn(f"Exec={bin_dir}/roaring-cd-player", desktop)
@@ -709,6 +725,7 @@ class InstallerSmokeTests(unittest.TestCase):
         bin_dir = home / ".local/bin"
         self.assertTrue((config_root / "systemd/user/roaring-presenced.socket").is_file())
         self.assertTrue((config_root / "systemd/user/roaring-cd-presence@.service").is_file())
+        self.assertIn("roaring-presence-doctor --component audio-cd", _result.stdout)
         self.assertFalse((config_root / "systemd/user/roaring-cd-player@.service").exists())
         self.assertTrue((bin_dir / "roaring-minecraft-presence").is_file())
         self.assertTrue((bin_dir / "roaring-presence-assets").is_file())

@@ -71,8 +71,16 @@ search if a package has been renamed or split.
 
 ### Fedora, Nobara and related DNF systems
 
+Base standalone playback and tracking:
+
 ```bash
-sudo dnf install mpv python3-pyqt6 python3-psutil
+sudo dnf install mpv python3-psutil
+```
+
+Recommended full player UI and MPRIS/media-key integration:
+
+```bash
+sudo dnf install python3-pyqt6
 ```
 
 For the optional image tools:
@@ -88,10 +96,16 @@ it. Fedora publishes `mpv`, `python3-pyqt6`, `python3-psutil`, and
 
 ### Ubuntu and Debian-family systems
 
-On Ubuntu releases that provide these packages:
+Base standalone playback and tracking:
 
 ```bash
-sudo apt install mpv python3-pyqt6 python3-psutil
+sudo apt install mpv python3-psutil
+```
+
+Recommended full player UI and MPRIS/media-key integration:
+
+```bash
+sudo apt install python3-pyqt6
 ```
 
 Optional image utilities and `cd-info` fallback:
@@ -105,8 +119,16 @@ separate Python packages. [Ubuntu package references](#package-references)
 
 ### Arch Linux
 
+Base standalone playback and tracking:
+
 ```bash
-sudo pacman -S mpv python-pyqt6 python-psutil libcdio
+sudo pacman -S mpv python-psutil libcdio
+```
+
+Recommended full player UI and MPRIS/media-key integration:
+
+```bash
+sudo pacman -S python-pyqt6
 ```
 
 Optional image utilities:

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Installation and troubleshooting guide
+    url: https://github.com/Roaring1/roaring-presence/blob/main/docs/linux-installation.md
+    about: Check dependencies, install profiles, udev and updater instructions.
+  - name: Discord client compatibility
+    url: https://github.com/Roaring1/roaring-presence/blob/main/docs/discord-client-compatibility.md
+    about: Check RPC socket requirements and known client limitations.
