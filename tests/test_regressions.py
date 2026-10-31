@@ -699,6 +699,8 @@ class InstallerSmokeTests(unittest.TestCase):
         self.assertIn("providers/audio-cd/bin/roaring-cd-session", updater_source)
         self.assertIn("providers/audio-cd/bin/cd_paths.py", updater_source)
         self.assertIn("UPDATE_MINECRAFT", updater_source)
+        self.assertIn("UPDATER_TMP", (ROOT / "install.sh").read_text(encoding="utf-8"))
+        self.assertIn("mv -f \"$UPDATER_TMP\"", (ROOT / "install.sh").read_text(encoding="utf-8"))
 
     def test_all_profile_generates_presence_aware_update_recipe(self):
         temporary, home, root, _result = self.run_installer("--component", "all")

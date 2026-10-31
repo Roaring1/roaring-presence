@@ -204,7 +204,8 @@ if git -C "$HERE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
       UPDATE_CD_MODE=player
     fi
     [[ -n "${SELECTED[minecraft]:-}" ]] && UPDATE_MINECRAFT=1
-    cat > "$BIN_DIR/roaring-presence-update" <<UPDATER
+    UPDATER_TMP="$(mktemp "$BIN_DIR/.roaring-presence-update.XXXXXX")"
+    cat > "$UPDATER_TMP" <<UPDATER
 #!/usr/bin/env bash
 set -euo pipefail
 SOURCE_DIR=$SOURCE_DIR_Q
@@ -325,7 +326,15 @@ if [[ "\$UPDATE_MINECRAFT" == 1 ]] && systemctl --user is-active --quiet roaring
 fi
 echo "updated to GitHub commit \$(git rev-parse --short HEAD); active sessions refreshed"
 UPDATER
-    chmod 755 "$BIN_DIR/roaring-presence-update"
+    chmod 755 "$UPDATER_TMP"
+    # Atomic replacement is important when this installer is invoked by the
+    # updater itself: the running shell keeps its old file descriptor while
+    # future invocations see the newly generated script.
+    if ! cmp -s "$UPDATER_TMP" "$BIN_DIR/roaring-presence-update" 2>/dev/null; then
+      mv -f "$UPDATER_TMP" "$BIN_DIR/roaring-presence-update"
+    else
+      rm -f "$UPDATER_TMP"
+    fi
     if [[ -d "$HOME/bin" ]]; then
       ln -sfn "$BIN_DIR/roaring-presence-update" "$HOME/bin/roaring-presence-update"
     fi
