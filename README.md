@@ -434,6 +434,7 @@ See [architecture and lifecycle notes](docs/architecture.md) for the design.
 - [MIT License](LICENSE)
 - [Changelog](CHANGELOG.md)
 - [Support and supported scope](SUPPORT.md)
+- [Maintainer release procedure](docs/releasing.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
 - [Security policy](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)

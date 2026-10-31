@@ -48,5 +48,7 @@ user systemd unit files. Include a regression test for every behavior fix.
 - `providers/minecraft/` owns game-process discovery and lifecycle.
 - `tools/assets/` stays an offline image-preparation tool.
 
-See [architecture](docs/architecture.md) and
-[Linux installation](docs/linux-installation.md) before changing packaging.
+See [architecture](docs/architecture.md),
+[Linux installation](docs/linux-installation.md), and the
+[maintainer release procedure](docs/releasing.md) before changing packaging
+or preparing a release.
