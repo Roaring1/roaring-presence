@@ -59,13 +59,30 @@ jobs:
           STUB
           chmod +x "$RUNNER_TEMP/stub-bin/systemctl"
           PATH="$RUNNER_TEMP/stub-bin:$PATH" ./install.sh --component all
+      - name: Install standalone CD profile into a separate CI home
+        run: |
+          mkdir -p "$RUNNER_TEMP/player-profile-home"
+          env \
+            HOME="$RUNNER_TEMP/player-profile-home" \
+            XDG_CONFIG_HOME="$RUNNER_TEMP/player-profile-home/.config" \
+            XDG_DATA_HOME="$RUNNER_TEMP/player-profile-home/.local/share" \
+            XDG_RUNTIME_DIR="$RUNNER_TEMP/player-profile-runtime" \
+            PATH="$RUNNER_TEMP/stub-bin:$PATH" \
+            ./install.sh --component cd-player
       - name: Validate installed systemd unit syntax
         run: |
-          systemd-analyze verify \
+          UNIT_PATH="$HOME/.config/systemd/user:/usr/lib/systemd/user:/usr/lib/systemd/system:/lib/systemd/system"
+          SYSTEMD_UNIT_PATH="$UNIT_PATH" HOME="$HOME" systemd-analyze verify \
             "$HOME/.config/systemd/user/roaring-presenced.service" \
             "$HOME/.config/systemd/user/roaring-presenced.socket" \
             "$HOME/.config/systemd/user/roaring-cd-presence@.service" \
             "$HOME/.config/systemd/user/roaring-cd-presence-scan.service" \
-            "$HOME/.config/systemd/user/roaring-cd-player@.service" \
-            "$HOME/.config/systemd/user/roaring-cd-player-scan.service" \
-            "$HOME/.config/systemd/user/roaring-minecraft-presence.service"
+            "$HOME/.config/systemd/user/roaring-minecraft-presence.service" \
+            providers/audio-cd/systemd/user/roaring-cd-player@.service \
+            providers/audio-cd/systemd/user/roaring-cd-player-scan.service
+          PLAYER_HOME="$RUNNER_TEMP/player-profile-home"
+          PLAYER_UNIT_PATH="$PLAYER_HOME/.config/systemd/user:/usr/lib/systemd/user:/usr/lib/systemd/system:/lib/systemd/system"
+          SYSTEMD_UNIT_PATH="$PLAYER_UNIT_PATH" HOME="$PLAYER_HOME" systemd-analyze verify \
+            "$PLAYER_HOME/.config/systemd/user/roaring-cd-player@.service" \
+            "$PLAYER_HOME/.config/systemd/user/roaring-cd-player-scan.service" \
+            providers/audio-cd/systemd/user/roaring-cd-presence@.service
