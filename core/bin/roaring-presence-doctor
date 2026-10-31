@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""Read-only diagnostics for roaring-presence.
+
+The doctor never starts, stops, enables, or changes services. It only reads the
+configuration, checks optional tools and inspects an already-existing manager
+socket (it will not activate a missing socket).
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import os
+import shutil
+import socket
+import stat
+import subprocess
+from pathlib import Path
+from typing import Any
+
+CONFIG_PATH = Path(
+    os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+) / "roaring-presence" / "config.json"
+
+
+def runtime_dir() -> Path:
+    return Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+
+
+DEFAULT_IPC_SOCKET_CANDIDATES = [
+    "$XDG_RUNTIME_DIR/discord-ipc-{i}",
+    "$TMPDIR/discord-ipc-{i}",
+    "$TMP/discord-ipc-{i}",
+    "$TEMP/discord-ipc-{i}",
+    "/tmp/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/app/com.discordapp.Discord/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/app/dev.vencord.Vesktop/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/.flatpak/com.discordapp.Discord/xdg-run/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/.flatpak/dev.vencord.Vesktop/xdg-run/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/snap.discord/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/snap.discord-canary/discord-ipc-{i}",
+]
+
+
+def candidate_socket_paths(configured) -> list[Path]:
+    """Return unique existing Unix-socket nodes in configured-first order."""
+    preferred = configured if isinstance(configured, (list, tuple)) else []
+    templates = []
+    seen_templates = set()
+    for item in [*preferred, *DEFAULT_IPC_SOCKET_CANDIDATES]:
+        if isinstance(item, str) and item and item not in seen_templates:
+            templates.append(item)
+            seen_templates.add(item)
+
+    paths = []
+    seen_paths = set()
+    for template in templates:
+        expanded = template.replace("${XDG_RUNTIME_DIR}", str(runtime_dir()))
+        expanded = expanded.replace("$XDG_RUNTIME_DIR", str(runtime_dir()))
+        expanded = os.path.expanduser(os.path.expandvars(expanded))
+        for index in range(10):
+            path = Path(expanded.replace("{i}", str(index)))
+            try:
+                if path not in seen_paths and path.is_socket():
+                    paths.append(path)
+                    seen_paths.add(path)
+            except OSError:
+                continue
+    return paths
+
+
+def add(results: list[dict[str, str]], level: str, area: str, message: str) -> None:
+    results.append({"level": level, "area": area, "message": message})
+
+
+def check_command(results: list[dict[str, str]], name: str, required: bool = False) -> None:
+    found = shutil.which(name)
+    if found:
+        add(results, "ok", "dependencies", f"{name}: {found}")
+    elif required:
+        add(results, "error", "dependencies", f"{name}: not found")
+    else:
+        add(results, "info", "dependencies", f"{name}: not installed (only needed for related features)")
+
+
+def manager_status(results: list[dict[str, str]], query_manager: bool = False) -> None:
+    path = runtime_dir() / "roaring-presence.sock"
+    if not path.exists():
+        add(results, "info", "manager", "manager socket is absent; the socket unit may be stopped or not installed")
+        return
+    try:
+        if not stat.S_ISSOCK(path.stat().st_mode):
+            add(results, "error", "manager", f"{path} exists but is not a Unix socket")
+            return
+        if not query_manager:
+            add(
+                results,
+                "info",
+                "manager",
+                "socket endpoint exists; not contacted to avoid triggering systemd socket activation (use --query-manager to opt in)",
+            )
+            return
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(1.5)
+            client.connect(str(path))
+            client.sendall(b'{"cmd":"status"}\n')
+            response = b""
+            while b"\n" not in response and len(response) < 65536:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+        payload = json.loads(response.split(b"\n", 1)[0])
+        discord = payload.get("discord") or {}
+        providers = payload.get("providers") or []
+        winner = payload.get("winner") or "none"
+        add(
+            results,
+            "ok" if discord.get("connected") else "warning",
+            "manager",
+            f"manager reachable; Discord connected={bool(discord.get('connected'))}; winner={winner}; providers={len(providers)}",
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        add(results, "warning", "manager", f"could not query existing manager socket: {exc}")
+
+
+def python_module_available(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return False
+
+
+def mpv_protocols() -> set[str]:
+    """Read mpv's compiled-in protocols; CD playback needs cdda:// support."""
+    binary = shutil.which("mpv")
+    if not binary:
+        return set()
+    try:
+        result = subprocess.run(
+            [binary, "--list-protocols"], capture_output=True, text=True,
+            timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    protocols = set()
+    for line in (result.stdout + "\n" + result.stderr).splitlines():
+        token = line.strip()
+        if token.endswith("://"):
+            protocols.add(token[:-3])
+    return protocols
+
+
+def mpv_audio_outputs() -> set[str]:
+    """Read mpv's available output drivers without opening an audio device."""
+    binary = shutil.which("mpv")
+    if not binary:
+        return set()
+    try:
+        result = subprocess.run(
+            [binary, "--ao=help"], capture_output=True, text=True,
+            timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    outputs = set()
+    for line in (result.stdout + "\n" + result.stderr).splitlines():
+        fields = line.strip().split()
+        if fields and fields[0] != "Available" and fields[0].replace("_", "").replace("-", "").isalnum():
+            outputs.add(fields[0])
+    return outputs
+
+
+def run(query_manager: bool = False, component: str = "all") -> tuple[list[dict[str, str]], dict[str, Any]]:
+    results: list[dict[str, str]] = []
+    config: dict[str, Any] = {}
+    valid_components = {"all", "core", "cd-player", "audio-cd", "minecraft", "assets"}
+    if component not in valid_components:
+        raise ValueError(f"unknown component: {component}")
+    needs_discord = component in {"all", "core", "audio-cd", "minecraft"}
+    needs_cd = component in {"all", "cd-player", "audio-cd"}
+    needs_minecraft = component in {"all", "minecraft"}
+    needs_assets = component in {"all", "assets"}
+    needs_config = needs_discord or needs_minecraft
+    if not CONFIG_PATH.is_file():
+        if needs_config:
+            add(results, "warning", "config", f"no config at {CONFIG_PATH}; copy config/config.sample.json and set your Discord Application ID")
+        else:
+            add(results, "info", "config", "standalone CD player does not require a roaring-presence config")
+    else:
+        try:
+            loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                raise ValueError("top-level JSON value must be an object")
+            config = loaded
+            add(results, "ok", "config", f"valid JSON: {CONFIG_PATH}")
+        except (OSError, ValueError) as exc:
+            level = "error" if needs_config else "warning"
+            add(results, level, "config", f"cannot read optional player config: {exc}")
+
+    if needs_discord:
+        client_id = str(config.get("client_id") or "").strip()
+        if client_id:
+            if client_id.isdigit():
+                add(results, "ok", "config", "Discord Application ID is configured")
+            else:
+                add(results, "warning", "config", "client_id is not numeric; verify that it is the Discord Application ID")
+        else:
+            add(results, "warning", "config", "client_id is empty; presence can be prepared but cannot connect to Discord")
+
+        candidates = config.get("ipc_socket_candidates", DEFAULT_IPC_SOCKET_CANDIDATES)
+        if candidates is None:
+            candidates = DEFAULT_IPC_SOCKET_CANDIDATES
+        if isinstance(candidates, list):
+            existing = candidate_socket_paths(candidates)
+            if existing:
+                shown = ", ".join(str(path) for path in existing[:3])
+                if len(existing) > 3:
+                    shown += f", and {len(existing) - 3} more"
+                message = f"found {len(existing)} Discord IPC socket node(s): {shown}"
+            else:
+                message = (
+                    "no Discord IPC socket found; start a compatible desktop client, "
+                    "enable its local RPC integration if required, then rerun this check"
+                )
+            add(results, "ok" if existing else "info", "discord-ipc", message)
+        else:
+            add(results, "error", "config", "ipc_socket_candidates must be a JSON array")
+
+    check_command(results, "python3", required=True)
+    try:
+        import sys
+        version = sys.version_info
+        if version >= (3, 10):
+            add(results, "ok", "dependencies", f"Python {version.major}.{version.minor} meets the 3.10+ requirement")
+        else:
+            add(results, "error", "dependencies", f"Python {version.major}.{version.minor} is too old; install Python 3.10 or newer")
+    except Exception:
+        pass
+
+    if needs_discord or needs_cd or needs_minecraft:
+        check_command(results, "systemctl", required=True)
+    if needs_cd:
+        check_command(results, "udevadm")
+        check_command(results, "mpv", required=True)
+        protocols = mpv_protocols()
+        if "cdda" in protocols:
+            add(results, "ok", "audio", "mpv CDDA protocol is available")
+        elif protocols:
+            add(results, "error", "audio", "mpv was found but lacks cdda:// support; install a build with CDDA/libcdio enabled")
+        else:
+            add(results, "warning", "audio", "could not inspect mpv protocol support")
+        check_command(results, "cd-info")
+        check_command(results, "kdialog")
+        check_command(results, "zenity")
+        for module, label, required in (
+            ("psutil", "psutil (CD playback/process discovery)", True),
+            ("PyQt6", "PyQt6 (CD player UI)", False),
+            ("PyQt6.QtDBus", "QtDBus (MPRIS/media-key integration)", False),
+        ):
+            available = python_module_available(module)
+            add(
+                results,
+                "ok" if available else ("info" if not required else "error"),
+                "dependencies",
+                f"{label}: {'available' if available else 'not installed'}",
+            )
+        outputs = mpv_audio_outputs()
+        if "pulse" in outputs:
+            add(results, "ok", "audio", "mpv PulseAudio output is available (best desktop app identity on KDE/PipeWire-Pulse)")
+        elif outputs:
+            add(results, "info", "audio", "mpv has no PulseAudio output; it will use its default backend")
+        else:
+            add(results, "warning", "audio", "could not inspect mpv audio outputs")
+
+    if needs_assets:
+        available = python_module_available("PIL")
+        add(
+            results,
+            "ok" if available else "info",
+            "dependencies",
+            f"Pillow (asset tools): {'available' if available else 'not installed'}",
+        )
+        assets = config.get("assets") or {}
+        if isinstance(assets, dict):
+            for feature, key in assets.items():
+                if not isinstance(key, str) or not key.strip():
+                    add(results, "warning", "assets", f"asset key for {feature!r} is empty or invalid")
+                elif len(key) > 100:
+                    add(results, "warning", "assets", f"asset key for {feature!r} is longer than 100 characters")
+            add(results, "ok", "assets", f"{len(assets)} configured Discord asset key(s)")
+
+    if needs_discord:
+        manager_status(results, query_manager=query_manager)
+    summary = {
+        "checks": len(results),
+        "errors": sum(item["level"] == "error" for item in results),
+        "warnings": sum(item["level"] == "warning" for item in results),
+        "info": sum(item["level"] == "info" for item in results),
+    }
+    return results, summary
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    parser.add_argument("--component", choices=("all", "core", "cd-player", "audio-cd", "minecraft", "assets"), default="all", help="limit checks to one installed feature")
+    parser.add_argument(
+        "--query-manager",
+        action="store_true",
+        help="connect to the existing manager socket (may activate its systemd service)",
+    )
+    args = parser.parse_args(argv)
+    results, summary = run(query_manager=args.query_manager, component=args.component)
+    if args.json:
+        print(json.dumps({"summary": summary, "checks": results}, indent=2))
+    else:
+        for item in results:
+            marker = {"ok": "OK", "warning": "WARN", "error": "ERROR", "info": "INFO"}[item["level"]]
+            print(f"{marker:5} {item['area']}: {item['message']}")
+        print(
+            f"\n{summary['checks']} checks · {summary['errors']} errors · "
+            f"{summary['warnings']} warnings · {summary['info']} informational"
+        )
+        print(f"Read-only: checked {args.component}; no service or configuration changes were made.")
+    return 1 if summary["errors"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

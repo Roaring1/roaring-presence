@@ -1,0 +1,12 @@
+[Unit]
+Description=Minecraft presence provider for roaring-presenced
+Documentation=https://github.com/Roaring1/roaring-presence
+After=roaring-presenced.socket
+Wants=roaring-presenced.socket
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/roaring-minecraft-presence
+Restart=no
+Slice=background.slice
+Nice=5

@@ -1,14 +1,1 @@
-[Unit]
-StartLimitIntervalSec=600
-StartLimitBurst=10
-Description=roaring-presence audio CD provider (%I)
-After=roaring-presenced.socket
-Wants=roaring-presenced.socket
-
-[Service]
-Type=exec
-ExecStart=%h/bin/roaring-cd-presence /dev/%I
-Restart=on-failure
-RestartSec=10
-Slice=background.slice
-Nice=5
+../../providers/audio-cd/systemd/user/roaring-cd-presence@.service

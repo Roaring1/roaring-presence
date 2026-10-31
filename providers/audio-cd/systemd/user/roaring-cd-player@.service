@@ -1,0 +1,13 @@
+[Unit]
+Description=Audio CD player session (%I)
+Conflicts=roaring-cd-presence@%i.service
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/roaring-cd-session /dev/%I
+Restart=on-failure
+RestartSec=10
+Slice=background.slice
+Nice=5
