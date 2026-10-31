@@ -230,6 +230,12 @@ def mpv_argv(device: str, track, paused: bool = False) -> list:
     argv = [
         "mpv",
         "--no-video",
+        # Use the PulseAudio compatibility backend so PipeWire publishes the
+        # stream's application.name. Plasma's task-manager volume slider
+        # matches that name to the visible Audio CD task; native PipeWire mpv
+        # output only exposed node.name=mpv and could not be associated.
+        "--ao=pulse",
+        "--audio-client-name=Audio CD",
         "--cdda-device=%s" % device,
         "--input-ipc-server=%s" % socket,
         "--idle=yes" if paused else "--idle=no",

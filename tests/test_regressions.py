@@ -38,6 +38,10 @@ MINECRAFT = load_module(
     ROOT / "providers/minecraft/bin/roaring-minecraft-presence",
 )
 CD = load_module("roaring_presence_cd_test", ROOT / "providers/audio-cd/bin/roaring-cd-presence")
+CD_AUTOPLAY = load_module(
+    "roaring_presence_cd_autoplay_test",
+    ROOT / "providers/audio-cd/bin/roaring-cd-autoplay",
+)
 
 PIL_AVAILABLE = importlib.util.find_spec("PIL") is not None
 if PIL_AVAILABLE:
@@ -225,6 +229,14 @@ class MinecraftTests(unittest.TestCase):
                 killer.join(timeout=2)
 
 
+class AudioCdPlayerIntegrationTests(unittest.TestCase):
+    def test_mpv_stream_has_kde_task_identity(self):
+        argv = CD_AUTOPLAY.mpv_argv("/dev/sr0", 2)
+        self.assertIn("--ao=pulse", argv)
+        self.assertIn("--audio-client-name=Audio CD", argv)
+        self.assertIn("--cdda-device=/dev/sr0", argv)
+
+
 class AudioCdMetadataTests(unittest.TestCase):
     def setUp(self):
         self.cache = tempfile.TemporaryDirectory()
@@ -240,6 +252,73 @@ class AudioCdMetadataTests(unittest.TestCase):
     def tearDown(self):
         CD.CACHE_DIR = self.previous_cache
         self.cache.cleanup()
+
+    def test_disc_id_lookup_uses_release_group_when_release_has_no_art(self):
+        release = {
+            "id": "release-id",
+            "title": "Example Album",
+            "artist-credit": [{"name": "Example Artist"}],
+            "media": [{"tracks": [{"position": "1", "title": "Opening"}]}],
+            "release-group": {"id": "group-id"},
+        }
+        cover = "https://coverartarchive.org/release/example/front-500.jpg"
+        with mock.patch.object(CD, "http_json", return_value={"releases": [release]}) as request, \
+             mock.patch.object(CD, "caa_front", side_effect=[None, cover]) as art:
+            result = CD.resolve_metadata(self.disc, True, True)
+
+        self.assertEqual(result["release_group_id"], "group-id")
+        self.assertEqual(result["cover"], cover)
+        self.assertTrue(result["cover_art_checked"])
+        self.assertIn("release-groups", request.call_args.args[0])
+        self.assertEqual(
+            art.call_args_list,
+            [mock.call("release", "release-id"), mock.call("release-group", "group-id")],
+        )
+
+    def test_old_cache_backfills_release_group_cover_once(self):
+        discid = CD.musicbrainz_discid(self.disc["toc"], self.disc["leadout"])
+        cache_file = Path(self.cache.name) / f"disc-{discid}.v2.json"
+        cache_file.write_text(json.dumps({
+            "discid": discid,
+            "release_id": "release-id",
+            "cover": None,
+            "mb_titles": {"1": "Opening"},
+            "mb_album": "Example Album",
+            "mb_artist": "Example Artist",
+        }), encoding="utf-8")
+        cover = "https://coverartarchive.org/release/example/front-500.jpg"
+
+        with mock.patch.object(
+            CD, "mb_release_details", return_value={"release-group": {"id": "group-id"}}
+        ) as details, mock.patch.object(CD, "caa_front", side_effect=[None, cover]) as art:
+            result = CD.resolve_metadata(self.disc, True, True)
+
+        self.assertEqual(result["release_group_id"], "group-id")
+        self.assertEqual(result["cover"], cover)
+        details.assert_called_once_with("release-id")
+        self.assertEqual(
+            art.call_args_list,
+            [mock.call("release", "release-id"), mock.call("release-group", "group-id")],
+        )
+        saved = json.loads(cache_file.read_text(encoding="utf-8"))
+        self.assertEqual(saved["cover"], cover)
+        self.assertTrue(saved["cover_art_checked"])
+
+    def test_resolved_cover_url_wins_over_generic_cd_asset(self):
+        cover = "https://coverartarchive.org/release/example/front-500.jpg"
+        activity = CD.build_activity(
+            self.disc,
+            {
+                "discid": "example-disc",
+                "cover": cover,
+                "mb_album": "Example Album",
+                "mb_artist": "Example Artist",
+                "mb_titles": {1: "Opening"},
+            },
+            {"assets": {"cd": "generic-cd", "play": "play"}},
+            {"track": 1, "playing": True, "paused": False, "elapsed": 15, "length": 240},
+        )
+        self.assertEqual(activity["assets"]["large_image"], cover)
 
     def test_disabling_musicbrainz_is_offline_and_keeps_disc_id(self):
         with mock.patch.object(CD, "http_json", side_effect=AssertionError("network called")), \

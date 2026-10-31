@@ -605,7 +605,9 @@ def resolve_metadata(disc: dict, lookup_musicbrainz: bool, use_cover_art_archive
     result = {
         "discid": None,
         "release_id": None,
+        "release_group_id": None,
         "cover": None,
+        "cover_art_checked": False,
         "mb_titles": {},
         "mb_album": None,
         "mb_artist": None,
@@ -626,6 +628,7 @@ def resolve_metadata(disc: dict, lookup_musicbrainz: bool, use_cover_art_archive
             cached = json.load(fh)
         log.info("metadata cache hit (%s)", os.path.basename(cache_file))
         cached.setdefault("discid", discid)
+        cached.setdefault("release_group_id", None)
         titles = cached.get("mb_titles")
         if isinstance(titles, dict):
             normalized_titles = {}
@@ -637,6 +640,40 @@ def resolve_metadata(disc: dict, lookup_musicbrainz: bool, use_cover_art_archive
             cached["mb_titles"] = normalized_titles
         if not use_cover_art_archive:
             cached["cover"] = None
+            return cached
+        if cached.get("cover") or cached.get("cover_art_checked"):
+            return cached
+
+        # Older cache entries did not store the release-group ID, and older
+        # lookups could miss it when the disc-ID response already contained
+        # tracks. Upgrade those entries once so release-group-only artwork is
+        # discoverable without making every insertion repeat failed requests.
+        release_id = cached.get("release_id")
+        group = cached.get("release_group_id")
+        if release_id:
+            if not group:
+                try:
+                    details = mb_release_details(release_id)
+                    group = (details.get("release-group") or {}).get("id")
+                    cached["release_group_id"] = group
+                except Exception as exc:  # noqa: BLE001
+                    log.info("cached release detail lookup skipped: %s", exc)
+            for kind, mbid in (("release", release_id), ("release-group", group)):
+                try:
+                    cover = caa_front(kind, mbid)
+                except Exception as exc:  # noqa: BLE001
+                    log.info("cover art (%s) skipped: %s", kind, exc)
+                    continue
+                if cover:
+                    cached["cover"] = cover
+                    log.info("cover art from %s", kind)
+                    break
+            cached["cover_art_checked"] = True
+            try:
+                with open(cache_file, "w", encoding="utf-8") as fh:
+                    json.dump(cached, fh)
+            except OSError:
+                pass
         return cached
     except Exception:  # noqa: BLE001 - cache miss is normal
         pass
@@ -648,7 +685,7 @@ def resolve_metadata(disc: dict, lookup_musicbrainz: bool, use_cover_art_archive
     try:
         payload = http_json(
             "https://musicbrainz.org/ws/2/discid/%s"
-            "?fmt=json&inc=artist-credits+recordings" % discid
+            "?fmt=json&inc=artist-credits+recordings+release-groups" % discid
         )
         releases = payload.get("releases") or []
     except Exception as exc:  # noqa: BLE001 - offline / unknown disc is fine
@@ -677,7 +714,10 @@ def resolve_metadata(disc: dict, lookup_musicbrainz: bool, use_cover_art_archive
         log.info("no MusicBrainz match; staying offline")
         return result
 
-    if not (chosen.get("media") or []) and chosen.get("id"):
+    if chosen.get("id") and not (chosen.get("release-group") or {}).get("id"):
+        # The DiscID endpoint can return a full track list without a
+        # release-group. Fetch release details whenever that identity is
+        # missing; otherwise group-level Cover Art Archive lookup is skipped.
         try:
             chosen = mb_release_details(chosen["id"]) or chosen
         except Exception as exc:  # noqa: BLE001
@@ -701,6 +741,7 @@ def resolve_metadata(disc: dict, lookup_musicbrainz: bool, use_cover_art_archive
                 continue
 
     group = (chosen.get("release-group") or {}).get("id")
+    result["release_group_id"] = group
     if use_cover_art_archive:
         for kind, mbid in (("release", result["release_id"]), ("release-group", group)):
             try:
@@ -712,6 +753,7 @@ def resolve_metadata(disc: dict, lookup_musicbrainz: bool, use_cover_art_archive
                 result["cover"] = cover
                 log.info("cover art from %s", kind)
                 break
+        result["cover_art_checked"] = True
 
     if result["release_id"] or result["cover"] or result["mb_titles"]:
         try:

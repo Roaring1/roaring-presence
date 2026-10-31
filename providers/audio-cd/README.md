@@ -84,3 +84,22 @@ Linux CD-ROM ioctls are the primary reader. `cd-info` is optional fallback;
 `mpv` is used for the built-in playback route; PyQt6 is required only for the
 player window. A desktop MPRIS-capable session is required for panel/media-key
 integration.
+
+## KDE taskbar and per-app volume
+
+The built-in player advertises the MPRIS service
+`org.mpris.MediaPlayer2.roaringcd` with the matching
+`roaring-cd-player.desktop` desktop entry. On KDE Plasma 6, the Icons-Only
+Task Manager can show media controls and a per-task volume slider in the task
+tooltip. In Task Manager settings, the option is named **Show media and volume
+controls in tooltip**.
+
+The CD stream is started with mpv's PulseAudio compatibility output and the
+application name **Audio CD**. This is intentional: Plasma associates taskbar
+volume streams with a task by portal app ID, process ancestry, or application
+name. mpv's native PipeWire output only exposed a generic `mpv` node and did
+not match the visible Audio CD task. The PulseAudio compatibility path provides
+the app name Plasma needs while PipeWire continues to handle the actual audio.
+
+Hover over the Audio CD taskbar icon to access its per-app slider and media
+controls. This is separate from the system-wide output volume.
