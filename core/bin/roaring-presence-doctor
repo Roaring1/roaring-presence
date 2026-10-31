@@ -14,6 +14,7 @@ import os
 import shutil
 import socket
 import stat
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -123,11 +124,69 @@ def manager_status(results: list[dict[str, str]], query_manager: bool = False) -
         add(results, "warning", "manager", f"could not query existing manager socket: {exc}")
 
 
-def run(query_manager: bool = False) -> tuple[list[dict[str, str]], dict[str, Any]]:
+def python_module_available(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return False
+
+
+def mpv_protocols() -> set[str]:
+    """Read mpv's compiled-in protocols; CD playback needs cdda:// support."""
+    binary = shutil.which("mpv")
+    if not binary:
+        return set()
+    try:
+        result = subprocess.run(
+            [binary, "--list-protocols"], capture_output=True, text=True,
+            timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    protocols = set()
+    for line in (result.stdout + "\n" + result.stderr).splitlines():
+        token = line.strip()
+        if token.endswith("://"):
+            protocols.add(token[:-3])
+    return protocols
+
+
+def mpv_audio_outputs() -> set[str]:
+    """Read mpv's available output drivers without opening an audio device."""
+    binary = shutil.which("mpv")
+    if not binary:
+        return set()
+    try:
+        result = subprocess.run(
+            [binary, "--ao=help"], capture_output=True, text=True,
+            timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    outputs = set()
+    for line in (result.stdout + "\n" + result.stderr).splitlines():
+        fields = line.strip().split()
+        if fields and fields[0] != "Available" and fields[0].replace("_", "").replace("-", "").isalnum():
+            outputs.add(fields[0])
+    return outputs
+
+
+def run(query_manager: bool = False, component: str = "all") -> tuple[list[dict[str, str]], dict[str, Any]]:
     results: list[dict[str, str]] = []
     config: dict[str, Any] = {}
+    valid_components = {"all", "core", "cd-player", "audio-cd", "minecraft", "assets"}
+    if component not in valid_components:
+        raise ValueError(f"unknown component: {component}")
+    needs_discord = component in {"all", "core", "audio-cd", "minecraft"}
+    needs_cd = component in {"all", "cd-player", "audio-cd"}
+    needs_minecraft = component in {"all", "minecraft"}
+    needs_assets = component in {"all", "assets"}
+    needs_config = needs_discord or needs_minecraft
     if not CONFIG_PATH.is_file():
-        add(results, "warning", "config", f"no config at {CONFIG_PATH}; copy config/config.sample.json and set your Discord Application ID")
+        if needs_config:
+            add(results, "warning", "config", f"no config at {CONFIG_PATH}; copy config/config.sample.json and set your Discord Application ID")
+        else:
+            add(results, "info", "config", "standalone CD player does not require a roaring-presence config")
     else:
         try:
             loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -136,63 +195,103 @@ def run(query_manager: bool = False) -> tuple[list[dict[str, str]], dict[str, An
             config = loaded
             add(results, "ok", "config", f"valid JSON: {CONFIG_PATH}")
         except (OSError, ValueError) as exc:
-            add(results, "error", "config", f"cannot read config: {exc}")
+            level = "error" if needs_config else "warning"
+            add(results, level, "config", f"cannot read optional player config: {exc}")
 
-    client_id = str(config.get("client_id") or "").strip()
-    if client_id:
-        if client_id.isdigit():
-            add(results, "ok", "config", "Discord Application ID is configured")
+    if needs_discord:
+        client_id = str(config.get("client_id") or "").strip()
+        if client_id:
+            if client_id.isdigit():
+                add(results, "ok", "config", "Discord Application ID is configured")
+            else:
+                add(results, "warning", "config", "client_id is not numeric; verify that it is the Discord Application ID")
         else:
-            add(results, "warning", "config", "client_id is not numeric; verify that it is the Discord Application ID")
-    else:
-        add(results, "warning", "config", "client_id is empty; presence can be prepared but cannot connect to Discord")
+            add(results, "warning", "config", "client_id is empty; presence can be prepared but cannot connect to Discord")
 
-    candidates = config.get("ipc_socket_candidates", DEFAULT_IPC_SOCKET_CANDIDATES)
-    if candidates is None:
-        candidates = DEFAULT_IPC_SOCKET_CANDIDATES
-    if isinstance(candidates, list):
-        existing = candidate_socket_paths(candidates)
-        if existing:
-            shown = ", ".join(str(path) for path in existing[:3])
-            if len(existing) > 3:
-                shown += f", and {len(existing) - 3} more"
-            message = f"found {len(existing)} Discord IPC socket node(s): {shown}"
+        candidates = config.get("ipc_socket_candidates", DEFAULT_IPC_SOCKET_CANDIDATES)
+        if candidates is None:
+            candidates = DEFAULT_IPC_SOCKET_CANDIDATES
+        if isinstance(candidates, list):
+            existing = candidate_socket_paths(candidates)
+            if existing:
+                shown = ", ".join(str(path) for path in existing[:3])
+                if len(existing) > 3:
+                    shown += f", and {len(existing) - 3} more"
+                message = f"found {len(existing)} Discord IPC socket node(s): {shown}"
+            else:
+                message = (
+                    "no Discord IPC socket found; start a compatible desktop client, "
+                    "enable its local RPC integration if required, then rerun this check"
+                )
+            add(results, "ok" if existing else "info", "discord-ipc", message)
         else:
-            message = (
-                "no Discord IPC socket found; start a compatible desktop client, "
-                "enable its local RPC integration if required, then rerun this check"
-            )
-        add(results, "ok" if existing else "info", "discord-ipc", message)
-    else:
-        add(results, "error", "config", "ipc_socket_candidates must be a JSON array")
+            add(results, "error", "config", "ipc_socket_candidates must be a JSON array")
 
     check_command(results, "python3", required=True)
-    check_command(results, "systemctl")
-    check_command(results, "udevadm")
-    check_command(results, "cd-info")
-    check_command(results, "mpv")
-    for module, label, required in (
-        ("PyQt6", "PyQt6 (CD player UI)", False),
-        ("PIL", "Pillow (asset tools)", False),
-    ):
-        available = importlib.util.find_spec(module) is not None
+    try:
+        import sys
+        version = sys.version_info
+        if version >= (3, 10):
+            add(results, "ok", "dependencies", f"Python {version.major}.{version.minor} meets the 3.10+ requirement")
+        else:
+            add(results, "error", "dependencies", f"Python {version.major}.{version.minor} is too old; install Python 3.10 or newer")
+    except Exception:
+        pass
+
+    if needs_discord or needs_cd or needs_minecraft:
+        check_command(results, "systemctl", required=True)
+    if needs_cd:
+        check_command(results, "udevadm")
+        check_command(results, "mpv", required=True)
+        protocols = mpv_protocols()
+        if "cdda" in protocols:
+            add(results, "ok", "audio", "mpv CDDA protocol is available")
+        elif protocols:
+            add(results, "error", "audio", "mpv was found but lacks cdda:// support; install a build with CDDA/libcdio enabled")
+        else:
+            add(results, "warning", "audio", "could not inspect mpv protocol support")
+        check_command(results, "cd-info")
+        check_command(results, "kdialog")
+        check_command(results, "zenity")
+        for module, label, required in (
+            ("psutil", "psutil (CD playback/process discovery)", True),
+            ("PyQt6", "PyQt6 (CD player UI)", False),
+            ("PyQt6.QtDBus", "QtDBus (MPRIS/media-key integration)", False),
+        ):
+            available = python_module_available(module)
+            add(
+                results,
+                "ok" if available else ("info" if not required else "error"),
+                "dependencies",
+                f"{label}: {'available' if available else 'not installed'}",
+            )
+        outputs = mpv_audio_outputs()
+        if "pulse" in outputs:
+            add(results, "ok", "audio", "mpv PulseAudio output is available (best desktop app identity on KDE/PipeWire-Pulse)")
+        elif outputs:
+            add(results, "info", "audio", "mpv has no PulseAudio output; it will use its default backend")
+        else:
+            add(results, "warning", "audio", "could not inspect mpv audio outputs")
+
+    if needs_assets:
+        available = python_module_available("PIL")
         add(
             results,
-            "ok" if available else ("info" if not required else "error"),
+            "ok" if available else "info",
             "dependencies",
-            f"{label}: {'available' if available else 'not installed'}",
+            f"Pillow (asset tools): {'available' if available else 'not installed'}",
         )
+        assets = config.get("assets") or {}
+        if isinstance(assets, dict):
+            for feature, key in assets.items():
+                if not isinstance(key, str) or not key.strip():
+                    add(results, "warning", "assets", f"asset key for {feature!r} is empty or invalid")
+                elif len(key) > 100:
+                    add(results, "warning", "assets", f"asset key for {feature!r} is longer than 100 characters")
+            add(results, "ok", "assets", f"{len(assets)} configured Discord asset key(s)")
 
-    assets = config.get("assets") or {}
-    if isinstance(assets, dict):
-        for feature, key in assets.items():
-            if not isinstance(key, str) or not key.strip():
-                add(results, "warning", "assets", f"asset key for {feature!r} is empty or invalid")
-            elif len(key) > 100:
-                add(results, "warning", "assets", f"asset key for {feature!r} is longer than 100 characters")
-        add(results, "ok", "assets", f"{len(assets)} configured Discord asset key(s)")
-
-    manager_status(results, query_manager=query_manager)
+    if needs_discord:
+        manager_status(results, query_manager=query_manager)
     summary = {
         "checks": len(results),
         "errors": sum(item["level"] == "error" for item in results),
@@ -205,13 +304,14 @@ def run(query_manager: bool = False) -> tuple[list[dict[str, str]], dict[str, An
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    parser.add_argument("--component", choices=("all", "core", "cd-player", "audio-cd", "minecraft", "assets"), default="all", help="limit checks to one installed feature")
     parser.add_argument(
         "--query-manager",
         action="store_true",
         help="connect to the existing manager socket (may activate its systemd service)",
     )
     args = parser.parse_args(argv)
-    results, summary = run(query_manager=args.query_manager)
+    results, summary = run(query_manager=args.query_manager, component=args.component)
     if args.json:
         print(json.dumps({"summary": summary, "checks": results}, indent=2))
     else:
@@ -222,7 +322,7 @@ def main(argv: list[str] | None = None) -> int:
             f"\n{summary['checks']} checks · {summary['errors']} errors · "
             f"{summary['warnings']} warnings · {summary['info']} informational"
         )
-        print("Read-only: no service or configuration changes were made.")
+        print(f"Read-only: checked {args.component}; no service or configuration changes were made.")
     return 1 if summary["errors"] else 0
 
 

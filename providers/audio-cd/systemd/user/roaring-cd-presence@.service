@@ -1,13 +1,14 @@
 [Unit]
 StartLimitIntervalSec=600
 StartLimitBurst=10
-Description=roaring-presence audio CD provider (%I)
+Description=Discord-enabled audio CD session (%I)
+Conflicts=roaring-cd-player@%i.service
 After=roaring-presenced.socket
 Wants=roaring-presenced.socket
 
 [Service]
 Type=exec
-ExecStart=%h/bin/roaring-cd-presence /dev/%I
+ExecStart=%h/.local/bin/roaring-cd-presence /dev/%I
 Restart=on-failure
 RestartSec=10
 Slice=background.slice

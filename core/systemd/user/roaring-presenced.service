@@ -5,7 +5,7 @@ After=roaring-presenced.socket
 
 [Service]
 Type=exec
-ExecStart=%h/bin/roaring-presenced
+ExecStart=%h/.local/bin/roaring-presenced
 Restart=no
 Slice=background.slice
 Nice=5

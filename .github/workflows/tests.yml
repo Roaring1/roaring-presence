@@ -11,11 +11,20 @@ permissions:
 jobs:
   offline-tests:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.14"]
     steps:
       - uses: actions/checkout@v4
+      - name: Give installer smoke tests a named checkout branch
+        run: |
+          if [ -z "$(git branch --show-current)" ]; then
+            git switch -c ci-install-checkout
+          fi
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - name: Install optional image dependency
         run: python -m pip install --disable-pip-version-check Pillow
       - name: Compile maintained Python entry points
@@ -24,15 +33,39 @@ jobs:
             core/bin/roaring-presenced \
             core/bin/roaring-presence-doctor \
             providers/audio-cd/bin/roaring-cd-presence \
+            providers/audio-cd/bin/roaring-cd-session \
             providers/audio-cd/bin/roaring-cd-autoplay \
             providers/audio-cd/bin/roaring-cd-player \
+            providers/audio-cd/bin/cd_paths.py \
             providers/minecraft/bin/roaring-minecraft-presence \
             tools/assets/bin/roaring-presence-art.py \
             tools/assets/bin/roaring-presence-assets \
             tests/test_regressions.py
       - name: Validate sample configuration
         run: python -m json.tool config/config.sample.json >/dev/null
-      - name: Run offline regression tests
+      - name: Run offline regression and installer smoke tests
         run: python -m unittest discover -s tests -v
-      - name: Validate installer syntax
-        run: bash -n install.sh
+      - name: Validate shell scripts
+        run: bash -n install.sh providers/audio-cd/bin/roaring-presence-scan
+      - name: Install selected units into the ephemeral CI user home
+        run: |
+          mkdir -p "$RUNNER_TEMP/stub-bin"
+          cat > "$RUNNER_TEMP/stub-bin/systemctl" <<'STUB'
+          #!/bin/sh
+          case " $* " in
+            *" is-enabled "*) exit 1 ;;
+          esac
+          exit 0
+          STUB
+          chmod +x "$RUNNER_TEMP/stub-bin/systemctl"
+          PATH="$RUNNER_TEMP/stub-bin:$PATH" ./install.sh --component all
+      - name: Validate installed systemd unit syntax
+        run: |
+          systemd-analyze verify \
+            "$HOME/.config/systemd/user/roaring-presenced.service" \
+            "$HOME/.config/systemd/user/roaring-presenced.socket" \
+            "$HOME/.config/systemd/user/roaring-cd-presence@.service" \
+            "$HOME/.config/systemd/user/roaring-cd-presence-scan.service" \
+            "$HOME/.config/systemd/user/roaring-cd-player@.service" \
+            "$HOME/.config/systemd/user/roaring-cd-player-scan.service" \
+            "$HOME/.config/systemd/user/roaring-minecraft-presence.service"

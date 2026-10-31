@@ -1,19 +1,20 @@
 # roaring-presence
 
-**A modular Linux Rich Presence toolkit.** Publish useful Discord activity from
-things that are actually happening on your machine: an audio CD being played,
-a Minecraft session, or another provider that speaks the small local provider
-protocol.
+**A modular Linux audio-CD player with optional Discord Rich Presence.**
+Install just the CD player, or add the Discord publisher, Minecraft activity,
+and generic artwork tools when you need them. The standalone player does not
+require Discord, a Discord Application ID, or the shared presence daemon.
 
 This repository is a set of installable components, not one opaque desktop
 daemon:
 
 | Component | Job | When it runs |
 | --- | --- | --- |
-| **Core** | One Discord IPC connection, provider priority, status arbitration | Socket-activated; exits shortly after its last provider leaves |
-| **Audio CD** | Disc detection, metadata, playback state, player controls and eject cleanup | Started by an optical-disc event or explicit command; lives for that disc session |
-| **Minecraft** | Detect a game session and publish instance/server/world details | Started by a launcher hook or explicit command; watches that one process |
-| **Assets** | Prepare arbitrary images and generate the optional built-in artwork | One-shot local commands; no service |
+| **CD player** | Disc detection, metadata, playback controls, MPRIS/media keys and eject cleanup | Started by an optical-disc event or explicit command; lives for that disc session |
+| **Discord CD** | Publishes the same CD session as Discord Rich Presence through the shared core | Optional companion to the CD player; no duplicate player process |
+| **Core** | One Discord IPC connection and provider-priority arbitration | Socket-activated; exits shortly after its last provider leaves |
+| **Minecraft** | Detect a game session and publish instance/server/world details | Optional launcher-triggered provider; watches that one process |
+| **Assets** | Prepare arbitrary images and generate optional built-in artwork | One-shot local commands; no service |
 
 The core can be in the background while it is doing useful work. The distinction
 is that it has a defined job and lifecycle: the socket is passive, providers
@@ -23,33 +24,47 @@ watchdog installed by default.
 
 ## Pick the parts you want
 
-The default install includes everything:
+The default install is the standalone audio-CD player:
 
 ```bash
 ./install.sh
 ```
 
-Or install only what you use:
+It does not install or contact Discord. To add Discord Rich Presence for the
+same CD playback session, choose:
 
 ```bash
 ./install.sh --component audio-cd
-./install.sh --component minecraft
-./install.sh --component assets
-./install.sh --component core
+# equivalent, more explicit name:
+./install.sh --component discord-cd
 ```
 
-Audio-CD and Minecraft selections include the small core automatically.
-Components can be combined by repeating `--component`. See
-`./install.sh --help` for optional login scanning and legacy-bridge cleanup.
+Other parts stay opt-in:
 
-The installer:
+```bash
+./install.sh --component core
+./install.sh --component minecraft
+./install.sh --component assets
+./install.sh --component all
+```
+
+The Discord CD and Minecraft providers include the small core automatically.
+Components can be combined by repeating `--component`. See
+`./install.sh --help` for all options. The installer uses `~/.local/bin`,
+preserves existing configuration, and does not use sudo. A separate udev
+rule is optional for automatic disc insertion.
+
+For supported package names and setup details, see
+[Linux installation](docs/linux-installation.md).
+
+For Discord-enabled profiles, the installer:
 - installs only explicit executable entry points (never a broad `bin/*` glob);
 - preserves an existing user config rather than overwriting it;
 - enables only the core's passive systemd user socket;
 - does not enable the Minecraft provider or a periodic process watcher;
 - does not install the obsolete standalone Discord RPC bridge.
 
-The user needs a Discord Application ID. Open
+Only Discord-enabled components need a Discord Application ID. Open
 [Discord Developer Portal](https://discord.com/developers/applications), create
 or choose an application, and copy its **Application ID** into
 `~/.config/roaring-presence/config.json` as `client_id`. It is a public
@@ -58,8 +73,8 @@ application identifier, not a bot token or password.
 Then run the read-only setup check:
 
 ```bash
-roaring-presence-doctor
-roaring-presence-doctor --json
+~/.local/bin/roaring-presence-doctor
+~/.local/bin/roaring-presence-doctor --json
 ```
 
 It checks JSON configuration, the application ID, Discord IPC discovery,
@@ -114,7 +129,9 @@ See [core documentation](core/README.md) and
 
 ### Audio-CD provider
 
-`providers/audio-cd/` handles audio CDs from insertion to eject:
+`providers/audio-cd/` owns the shared audio-CD session engine. The
+`cd-player` install profile uses it without Discord; `audio-cd` adds the
+optional Rich Presence publisher. It handles audio CDs from insertion to eject:
 
 - reads the table of contents and CD-Text from the Linux kernel first, with
   `cd-info` as a fallback;
@@ -136,7 +153,7 @@ it on an audio-disc insertion event; KDE actions or a direct command can do
 the same. A one-shot catch-up scan is optional:
 
 ```bash
-./install.sh --component audio-cd
+./install.sh --component cd-player --enable-login-scan
 ./install.sh --component audio-cd --enable-login-scan
 ```
 
@@ -145,8 +162,8 @@ the installer. Without it, start the provider from your desktop's device
 action or run:
 
 ```bash
-roaring-cd-presence --once --dry-run -v
-roaring-cd-presence /dev/sr1
+~/.local/bin/roaring-cd-session /dev/sr1   # no Discord dependency
+~/.local/bin/roaring-cd-presence /dev/sr1  # publishes to Discord
 ```
 
 See [audio-CD documentation](providers/audio-cd/README.md).
@@ -176,7 +193,7 @@ For a launcher that can provide the actual Java PID, use
 For a one-shot payload test:
 
 ```bash
-roaring-minecraft-presence --demo --once --dry-run
+~/.local/bin/roaring-minecraft-presence --demo --once --dry-run
 ```
 
 See [Minecraft documentation](providers/minecraft/README.md).
@@ -227,9 +244,10 @@ The asset packer requires Pillow. See [asset-tool documentation](tools/assets/RE
 
 ## Configuration
 
-The installer copies `config/config.sample.json` to
+Discord-enabled profiles copy `config/config.sample.json` to
 `~/.config/roaring-presence/config.json` only if that file does not exist.
-Edit that user file; reinstalling will not overwrite it.
+The standalone CD player needs no config. Edit your user file; reinstalling
+will never overwrite it.
 
 The important top-level settings are:
 
@@ -255,9 +273,10 @@ The project targets Linux desktops with user systemd and Unix sockets.
 | --- | --- | --- |
 | Core | Python 3.10+; a compatible Discord desktop client exposing local RPC/IPC; Linux user systemd | Known native, Flatpak, and Snap socket paths are auto-discovered; custom paths can be added |
 | Audio-CD detection | Linux optical drive and kernel CD-ROM ioctls | `cd-info` fallback |
-| CD metadata | Network access for MusicBrainz | Cached/local CD-Text works offline |
-| CD playback | A CD-capable player such as mpv | Existing desktop audio-CD player |
-| CD player window | PyQt6 and a graphical session | CLI/autoplay-only operation |
+| CD playback | `mpv` with CDDA support | Other desktop CD players can be used outside the built-in UI |
+| CD session tracking | `psutil` for active-player discovery, track and progress tracking | Required for reliable session state and autoplay avoidance |
+| CD player window | PyQt6, QtDBus and a graphical session | kdialog/zenity prompt and command-line playback |
+| CD metadata | Network access for MusicBrainz/CAA | Cached metadata and local CD-Text work offline |
 | Automatic disc insert | udev rule installed once as root | KDE device action or manual command |
 | Minecraft session | Java/Bedrock client | psutil is optional; Linux `/proc` fallback is built in |
 | Asset tools | Python and Pillow | None |
@@ -305,6 +324,8 @@ python3 -m py_compile \
   providers/audio-cd/bin/roaring-cd-presence \
   providers/audio-cd/bin/roaring-cd-autoplay \
   providers/audio-cd/bin/roaring-cd-player \
+  providers/audio-cd/bin/roaring-cd-session \
+  providers/audio-cd/bin/cd_paths.py \
   providers/minecraft/bin/roaring-minecraft-presence \
   tools/assets/bin/roaring-presence-art.py \
   tools/assets/bin/roaring-presence-assets
@@ -317,12 +338,23 @@ process for the pidfd lifecycle test. They do not need a CD in the drive,
 a running Minecraft game, or a live Discord session. GitHub Actions runs the
 same checks on pushes and pull requests.
 
-## Troubleshooting
+## Updating and troubleshooting
 
-Start with:
+A Git checkout install creates `roaring-presence-update`. It checks the
+configured GitHub branch, refuses to overwrite local edits or a diverged
+checkout, tests the candidate commit in a temporary worktree, then reinstalls
+the selected profile and refreshes active provider processes. Use:
 
 ```bash
-roaring-presence-doctor
+~/.local/bin/roaring-presence-update --check
+~/.local/bin/roaring-presence-update
+```
+
+Start diagnostics for the feature you use:
+
+```bash
+~/.local/bin/roaring-presence-doctor --component cd-player
+~/.local/bin/roaring-presence-doctor --component audio-cd
 journalctl --user -u roaring-presenced -f
 journalctl --user -u 'roaring-cd-presence@*' -f
 ```
@@ -330,15 +362,15 @@ journalctl --user -u 'roaring-cd-presence@*' -f
 Useful CD diagnostics:
 
 ```bash
-roaring-cd-presence /dev/sr1 --once --dry-run -v
+~/.local/bin/roaring-cd-presence /dev/sr1 --once --dry-run -v
 journalctl --user -u 'roaring-cd-presence@*' -f
-tail -f ~/.cache/roaring-presence/autoplay.log
+tail -f "${XDG_CACHE_HOME:-$HOME/.cache}/roaring-presence/autoplay.log"
 ```
 
 Useful Minecraft diagnostics:
 
 ```bash
-roaring-minecraft-presence --demo --once --dry-run
+~/.local/bin/roaring-minecraft-presence --demo --once --dry-run
 journalctl --user -u roaring-minecraft-presence -f
 ```
 

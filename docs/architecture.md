@@ -3,27 +3,26 @@
 ## Responsibility boundaries
 
 ```text
-                 optical media event          launcher event
-                         |                           |
-                         v                           v
-                audio-CD provider             Minecraft provider
-                   |        |                        |
-          kernel TOC   finite metadata job     PID discovery once
-          + playback         |                        |
-                   |    MusicBrainz / CAA        pidfd + inotify
-                   |        |                        |
-                   +--------+-----------+------------+
-                                        |
-                                        v
-                             local Unix provider socket
-                                        |
-                                        v
-                               core / roaring-presenced
-                                        |
-                               one Discord IPC link
-                                        |
-                                        v
-                                  Discord/Vesktop
+                   optical media event             launcher event
+                          |                              |
+                          v                              v
+                   audio-CD session                Minecraft provider
+                   /              \
+          player-only mode      Discord mode                 |
+             |                  |                            |
+        kernel TOC          kernel TOC                 PID discovery once
+        + playback          + playback                       |
+        + MPRIS             + MPRIS                    pidfd + inotify
+             |                  |
+             |             local provider socket
+             |                  |
+             |                  v
+             |          core / roaring-presenced
+             |                  |
+             |           one Discord IPC link
+             |                  |
+             v                  v
+        Desktop audio       Discord client
 
         tools/assets: independent local image preparation commands
 ```
@@ -41,10 +40,16 @@ manager is short-lived when no provider is connected.
 
 An insertion event starts one per-drive process. It performs immediate local
 disc reads, then one bounded online metadata task (optional). It follows
-playback and drive state for the lifetime of the inserted disc, publishing
-only meaningful changes. It checks drive state at a short interval to catch
-ejects even when the player has no common eject notification interface. That
-is intentional active-session monitoring, not an idle global watcher.
+playback and drive state for the lifetime of the inserted disc and checks for
+ejects during that session. There are two modes over the same engine:
+
+- **Player-only:** starts playback, publishes MPRIS/media-key controls, and
+  monitors eject. It has no connection or dependency on the Discord core.
+- **Discord-enabled:** does the same work, plus sends activity messages over
+  the provider socket to the shared core. The core remains the only Discord
+  IPC client.
+
+Neither mode leaves a global drive-polling watcher running.
 
 ### Minecraft
 

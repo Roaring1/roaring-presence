@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""roaring-cd-presence -- audio-CD provider for roaring-presenced.
+"""roaring-cd-presence -- managed audio-CD session with optional Discord publishing.
 
 Lifecycle is the disc session: started when an audio CD is inserted (KDE Solid
 action or udev), exits when the disc is ejected. Its work is limited to the
@@ -11,7 +11,7 @@ What it does
   1. reads the TOC and CD-Text directly from the kernel, with cd-info fallback
   2. optionally resolves artist, album, and track metadata from MusicBrainz;
      cover art is a separate opt-in lookup from the Cover Art Archive
-  3. connects to the manager socket and publishes a "Listening to ..." activity
+  3. optionally connects to the manager socket and publishes a "Listening to ..." activity
   4. follows playback: current track from the kio-fuse filename, or from the
      Full-CD wav position mapped through the TOC via mpv's JSON IPC
   5. on eject: clears the activity, disconnects, exits
@@ -1004,6 +1004,14 @@ class ManagerLink:
             self.sock = None
 
 
+def manager_link_for_mode(player_only: bool, dry_run: bool = False):
+    """Return a connected publisher, False on failure, or None for CD-only."""
+    if player_only:
+        return None
+    link = ManagerLink(os.path.join(runtime_dir(), "roaring-presence.sock"), dry_run)
+    return link if link.connect() else False
+
+
 # --------------------------------------------------------------------------
 # activity building
 # --------------------------------------------------------------------------
@@ -1480,7 +1488,12 @@ def install_signal_handlers() -> None:
 
 def main(argv: list) -> int:
     install_signal_handlers()
-    parser = argparse.ArgumentParser(description="Audio-CD provider for roaring-presenced")
+    parser = argparse.ArgumentParser(description="Manage an audio-CD session; Discord publishing is optional")
+    parser.add_argument(
+        "--player-only",
+        action="store_true",
+        help="detect, describe, play, and monitor the CD without connecting to Discord",
+    )
     parser.add_argument("device", nargs="?", default=None)
     parser.add_argument("--once", action="store_true", help="publish once and exit")
     parser.add_argument("--dry-run", action="store_true", help="print payloads, touch nothing")
@@ -1600,9 +1613,11 @@ def main(argv: list) -> int:
     if meta.get("cover"):
         log.info("cover art: %s", meta["cover"])
 
-    link = ManagerLink(os.path.join(runtime_dir(), "roaring-presence.sock"), args.dry_run)
-    if not link.connect():
+    link = manager_link_for_mode(args.player_only, args.dry_run)
+    if link is False:
         return 3
+    if args.player_only:
+        log.info("player-only mode: Discord publishing is disabled")
 
     priority = int(cfg.get("priorities", {}).get("cd", 50))
     session_start = time.time()
@@ -1616,7 +1631,8 @@ def main(argv: list) -> int:
     last_elapsed = None
 
     def push(activity) -> None:
-        link.send({"provider": "cd", "priority": priority, "activity": activity})
+        if link is not None:
+            link.send({"provider": "cd", "priority": priority, "activity": activity})
 
     if cd_cfg.get("autoplay_prompt", True) and not args.dry_run:
         if not prompted["done"]:
@@ -1703,7 +1719,8 @@ def main(argv: list) -> int:
         time.sleep(0.3)
         return 0
     finally:
-        link.close()
+        if link is not None:
+            link.close()
 
 
 if __name__ == "__main__":

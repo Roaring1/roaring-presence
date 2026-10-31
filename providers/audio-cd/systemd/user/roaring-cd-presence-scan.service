@@ -1,12 +1,12 @@
 [Unit]
-Description=roaring-presence audio CD catch-up scan
+Description=roaring-presence Discord-enabled audio CD catch-up scan
 Documentation=https://github.com/Roaring1/roaring-presence
 After=roaring-presenced.socket
 Wants=roaring-presenced.socket
 
 [Service]
 Type=oneshot
-ExecStart=%h/bin/roaring-presence-scan
+ExecStart=%h/.local/bin/roaring-presence-scan
 Slice=background.slice
 Nice=5
 

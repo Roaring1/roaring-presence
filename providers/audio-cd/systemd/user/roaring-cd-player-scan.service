@@ -1,0 +1,12 @@
+[Unit]
+Description=Audio CD player catch-up scan
+Documentation=https://github.com/Roaring1/roaring-presence
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/roaring-presence-scan --player-only
+Slice=background.slice
+Nice=5
+
+[Install]
+WantedBy=default.target

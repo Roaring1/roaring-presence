@@ -1,8 +1,9 @@
 # Core publisher
 
-The core is the Discord-facing part of roaring-presence. It owns one local
-Discord IPC connection and arbitrates independent providers; it does not read
-CD drives, inspect game instances, download metadata, or render artwork.
+The core is the optional Discord-facing part of roaring-presence. It owns one
+local Discord IPC connection and arbitrates independent providers; it does not
+read CD drives, inspect game instances, download metadata, or render artwork.
+The standalone CD player has no dependency on this component.
 
 ## Lifecycle
 

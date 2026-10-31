@@ -41,7 +41,6 @@ import fcntl
 import json
 import os
 import select
-import shutil
 import socket
 import subprocess
 import sys
@@ -49,6 +48,7 @@ import threading
 import time
 import urllib.request
 from typing import Any
+from cd_paths import installed_program
 
 os.environ.setdefault(
     "QT_LOGGING_RULES",
@@ -66,8 +66,14 @@ from PyQt6.QtDBus import (
 APP_ID = "roaringcd"
 MPRIS_SERVICE = "org.mpris.MediaPlayer2." + APP_ID
 MPRIS_PATH = "/org/mpris/MediaPlayer2"
-CONFIG_PATH = "~/.config/roaring-presence/config.json"
-CACHE_DIR = "~/.cache/roaring-presence"
+CONFIG_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "roaring-presence", "config.json",
+)
+CACHE_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+    "roaring-presence",
+)
 AUTOPLAY = "roaring-cd-autoplay"
 
 # Preload: the drive is already spinning right after an insert (the
@@ -990,7 +996,7 @@ class PlayerService(QtCore.QObject):
         self.claim_preload()
         if self.starting:
             return  # already spinning up; do not launch a second mpv
-        binary = shutil.which(AUTOPLAY) or expand("~/bin/" + AUTOPLAY)
+        binary = installed_program(AUTOPLAY)
         argv = [binary, "--device", self.disc.device]
         argv += ["--album"] if album or not track else ["--track", str(track)]
         try:
@@ -1016,7 +1022,7 @@ class PlayerService(QtCore.QObject):
         """Open the disc paused at track 1 so the play button is instant."""
         if self.alive or self.starting or self.ejecting or self.preload_owned:
             return
-        binary = shutil.which(AUTOPLAY) or expand("~/bin/" + AUTOPLAY)
+        binary = installed_program(AUTOPLAY)
         try:
             subprocess.Popen(
                 [binary, "--device", self.disc.device, "--preload"],
