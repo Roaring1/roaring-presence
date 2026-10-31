@@ -1,11 +1,17 @@
 {
   "client_id": "",
   "ipc_socket_candidates": [
-    "$XDG_RUNTIME_DIR/.flatpak/dev.vencord.Vesktop/xdg-run/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/discord-ipc-{i}",
+    "$TMPDIR/discord-ipc-{i}",
+    "$TMP/discord-ipc-{i}",
+    "$TEMP/discord-ipc-{i}",
+    "/tmp/discord-ipc-{i}",
     "$XDG_RUNTIME_DIR/app/com.discordapp.Discord/discord-ipc-{i}",
     "$XDG_RUNTIME_DIR/app/dev.vencord.Vesktop/discord-ipc-{i}",
-    "$XDG_RUNTIME_DIR/discord-ipc-{i}",
-    "/tmp/discord-ipc-{i}"
+    "$XDG_RUNTIME_DIR/.flatpak/com.discordapp.Discord/xdg-run/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/.flatpak/dev.vencord.Vesktop/xdg-run/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/snap.discord/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/snap.discord-canary/discord-ipc-{i}"
   ],
   "idle_exit_seconds": 1,
   "priorities": {

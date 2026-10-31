@@ -26,6 +26,48 @@ def runtime_dir() -> Path:
     return Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
 
 
+DEFAULT_IPC_SOCKET_CANDIDATES = [
+    "$XDG_RUNTIME_DIR/discord-ipc-{i}",
+    "$TMPDIR/discord-ipc-{i}",
+    "$TMP/discord-ipc-{i}",
+    "$TEMP/discord-ipc-{i}",
+    "/tmp/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/app/com.discordapp.Discord/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/app/dev.vencord.Vesktop/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/.flatpak/com.discordapp.Discord/xdg-run/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/.flatpak/dev.vencord.Vesktop/xdg-run/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/snap.discord/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/snap.discord-canary/discord-ipc-{i}",
+]
+
+
+def candidate_socket_paths(configured) -> list[Path]:
+    """Return unique existing Unix-socket nodes in configured-first order."""
+    preferred = configured if isinstance(configured, (list, tuple)) else []
+    templates = []
+    seen_templates = set()
+    for item in [*preferred, *DEFAULT_IPC_SOCKET_CANDIDATES]:
+        if isinstance(item, str) and item and item not in seen_templates:
+            templates.append(item)
+            seen_templates.add(item)
+
+    paths = []
+    seen_paths = set()
+    for template in templates:
+        expanded = template.replace("${XDG_RUNTIME_DIR}", str(runtime_dir()))
+        expanded = expanded.replace("$XDG_RUNTIME_DIR", str(runtime_dir()))
+        expanded = os.path.expanduser(os.path.expandvars(expanded))
+        for index in range(10):
+            path = Path(expanded.replace("{i}", str(index)))
+            try:
+                if path not in seen_paths and path.is_socket():
+                    paths.append(path)
+                    seen_paths.add(path)
+            except OSError:
+                continue
+    return paths
+
+
 def add(results: list[dict[str, str]], level: str, area: str, message: str) -> None:
     results.append({"level": level, "area": area, "message": message})
 
@@ -105,23 +147,22 @@ def run(query_manager: bool = False) -> tuple[list[dict[str, str]], dict[str, An
     else:
         add(results, "warning", "config", "client_id is empty; presence can be prepared but cannot connect to Discord")
 
-    candidates = config.get("ipc_socket_candidates") or []
+    candidates = config.get("ipc_socket_candidates", DEFAULT_IPC_SOCKET_CANDIDATES)
+    if candidates is None:
+        candidates = DEFAULT_IPC_SOCKET_CANDIDATES
     if isinstance(candidates, list):
-        existing = []
-        for item in candidates:
-            if not isinstance(item, str):
-                continue
-            expanded = os.path.expanduser(os.path.expandvars(item.replace("$XDG_RUNTIME_DIR", str(runtime_dir()))))
-            for index in range(10):
-                path = Path(expanded.replace("{i}", str(index)))
-                if path.exists():
-                    existing.append(path)
-        add(
-            results,
-            "ok" if existing else "info",
-            "discord-ipc",
-            f"found {len(existing)} candidate Discord IPC socket(s)" if existing else "no configured Discord IPC socket found; start Discord/Vesktop before testing presence",
-        )
+        existing = candidate_socket_paths(candidates)
+        if existing:
+            shown = ", ".join(str(path) for path in existing[:3])
+            if len(existing) > 3:
+                shown += f", and {len(existing) - 3} more"
+            message = f"found {len(existing)} Discord IPC socket node(s): {shown}"
+        else:
+            message = (
+                "no Discord IPC socket found; start a compatible desktop client, "
+                "enable its local RPC integration if required, then rerun this check"
+            )
+        add(results, "ok" if existing else "info", "discord-ipc", message)
     else:
         add(results, "error", "config", "ipc_socket_candidates must be a JSON array")
 

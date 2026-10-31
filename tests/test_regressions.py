@@ -95,6 +95,42 @@ class ManagerTests(unittest.TestCase):
                 manager.sel.close()
             server.close()
 
+    def test_generic_discord_ipc_locations_are_defaulted(self):
+        candidates = CORE.socket_candidate_templates([])
+        self.assertEqual(candidates[0], "$XDG_RUNTIME_DIR/discord-ipc-{i}")
+        for expected in (
+            "$TMPDIR/discord-ipc-{i}",
+            "$TMP/discord-ipc-{i}",
+            "$TEMP/discord-ipc-{i}",
+            "/tmp/discord-ipc-{i}",
+            "$XDG_RUNTIME_DIR/app/com.discordapp.Discord/discord-ipc-{i}",
+            "$XDG_RUNTIME_DIR/.flatpak/dev.vencord.Vesktop/xdg-run/discord-ipc-{i}",
+            "$XDG_RUNTIME_DIR/snap.discord/discord-ipc-{i}",
+        ):
+            self.assertIn(expected, candidates)
+
+    def test_custom_discord_ipc_paths_are_preferred_and_defaults_remain_fallbacks(self):
+        custom = ["/custom/client/discord-ipc-{i}", "$XDG_RUNTIME_DIR/discord-ipc-{i}"]
+        candidates = CORE.socket_candidate_templates(custom)
+        self.assertEqual(candidates[:2], custom)
+        self.assertIn("$TMPDIR/discord-ipc-{i}", candidates)
+        self.assertEqual(len(candidates), len(set(candidates)))
+
+    def test_discord_ipc_path_expands_standard_temp_variables(self):
+        with mock.patch.dict(os.environ, {
+            "XDG_RUNTIME_DIR": "/run/user/1234",
+            "TMPDIR": "/var/tmp/user",
+            "TMP": "/tmp/user",
+            "TEMP": "/var/tmp/other",
+        }):
+            ipc = CORE.DiscordIPC("123456", ["$TMPDIR/custom-{i}"])
+            paths = list(ipc._paths())
+        self.assertEqual(paths[0], "/var/tmp/user/custom-0")
+        self.assertIn("/run/user/1234/discord-ipc-0", paths)
+        self.assertIn("/var/tmp/user/discord-ipc-0", paths)
+        self.assertIn("/tmp/user/discord-ipc-0", paths)
+        self.assertIn("/var/tmp/other/discord-ipc-0", paths)
+
     def test_discord_frame_encodes_little_endian_header(self):
         frame = CORE.DiscordIPC._frame(CORE.OP_FRAME, {"ok": True})
         op, length = struct.unpack("<II", frame[:8])
@@ -362,6 +398,24 @@ class AudioCdMetadataTests(unittest.TestCase):
 
 
 class DoctorTests(unittest.TestCase):
+    def test_doctor_checks_generic_paths_even_with_old_client_specific_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "runtime"
+            runtime.mkdir()
+            native_socket = runtime / "discord-ipc-0"
+            stale_path = runtime / "discord-ipc-1"
+            stale_path.write_text("not a socket", encoding="utf-8")
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                listener.bind(str(native_socket))
+                with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(runtime)}):
+                    found = DOCTOR.candidate_socket_paths([
+                        "$XDG_RUNTIME_DIR/.flatpak/dev.vencord.Vesktop/xdg-run/discord-ipc-{i}"
+                    ])
+                self.assertEqual(found, [native_socket])
+            finally:
+                listener.close()
+
     def test_default_doctor_does_not_connect_to_manager_socket(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_root = Path(tmp) / "config"

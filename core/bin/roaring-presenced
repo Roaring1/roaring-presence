@@ -37,15 +37,26 @@ CONFIG_PATH = os.path.join(
     "config.json",
 )
 
+# Discord documents these standard IPC locations for Linux/macOS. The
+# additional paths cover common sandboxed package layouts; they are fallbacks,
+# not a dependency on any particular client, plugin, or package manager.
+DEFAULT_IPC_SOCKET_CANDIDATES = [
+    "$XDG_RUNTIME_DIR/discord-ipc-{i}",
+    "$TMPDIR/discord-ipc-{i}",
+    "$TMP/discord-ipc-{i}",
+    "$TEMP/discord-ipc-{i}",
+    "/tmp/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/app/com.discordapp.Discord/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/app/dev.vencord.Vesktop/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/.flatpak/com.discordapp.Discord/xdg-run/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/.flatpak/dev.vencord.Vesktop/xdg-run/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/snap.discord/discord-ipc-{i}",
+    "$XDG_RUNTIME_DIR/snap.discord-canary/discord-ipc-{i}",
+]
+
 DEFAULT_CONFIG = {
     "client_id": "",
-    "ipc_socket_candidates": [
-        "$XDG_RUNTIME_DIR/.flatpak/dev.vencord.Vesktop/xdg-run/discord-ipc-{i}",
-        "$XDG_RUNTIME_DIR/app/com.discordapp.Discord/discord-ipc-{i}",
-        "$XDG_RUNTIME_DIR/app/dev.vencord.Vesktop/discord-ipc-{i}",
-        "$XDG_RUNTIME_DIR/discord-ipc-{i}",
-        "/tmp/discord-ipc-{i}",
-    ],
+    "ipc_socket_candidates": list(DEFAULT_IPC_SOCKET_CANDIDATES),
     "idle_exit_seconds": 1.0,
     "priorities": {"cd": 50, "minecraft": 10},
     "log_level": "info",
@@ -59,7 +70,23 @@ def runtime_dir() -> str:
 
 
 def expand(path: str) -> str:
-    return os.path.expanduser(path.replace("$XDG_RUNTIME_DIR", runtime_dir()))
+    # XDG_RUNTIME_DIR is required by the usual Discord path, but may be absent
+    # in hand-started sessions. Other temp variables are expanded when set.
+    path = path.replace("${XDG_RUNTIME_DIR}", runtime_dir())
+    path = path.replace("$XDG_RUNTIME_DIR", runtime_dir())
+    return os.path.expandvars(os.path.expanduser(path))
+
+
+def socket_candidate_templates(configured) -> list[str]:
+    """Keep user preferences first, but never lose portable built-in fallbacks."""
+    candidates = []
+    seen = set()
+    preferred = configured if isinstance(configured, (list, tuple)) else []
+    for item in [*preferred, *DEFAULT_IPC_SOCKET_CANDIDATES]:
+        if isinstance(item, str) and item and item not in seen:
+            candidates.append(item)
+            seen.add(item)
+    return candidates
 
 
 def load_config() -> dict:
@@ -79,7 +106,7 @@ class DiscordIPC:
 
     def __init__(self, client_id: str, candidates: list) -> None:
         self.client_id = client_id
-        self.candidates = candidates
+        self.candidates = socket_candidate_templates(candidates)
         self.sock = None
         self.path = None
         self.user = None
@@ -127,9 +154,14 @@ class DiscordIPC:
         log.debug("next discord connect attempt in %ss", delay)
 
     def _paths(self):
+        seen = set()
         for template in self.candidates:
+            expanded = expand(template)
             for i in range(10):
-                yield expand(template).replace("{i}", str(i))
+                path = expanded.replace("{i}", str(i))
+                if path not in seen:
+                    seen.add(path)
+                    yield path
 
     def connect(self) -> bool:
         if not self.client_id:

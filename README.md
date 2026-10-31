@@ -68,6 +68,21 @@ does not connect to that socket, so it cannot trigger systemd activation. Use
 `roaring-presence-doctor --query-manager` only when you explicitly want a live
 status request; connecting may activate the manager socket.
 
+## Discord client compatibility
+
+This project is a local Discord RPC client. It sends activity to a running
+Discord-compatible desktop client over a Unix socket; it does not inspect how
+the client is packaged and does not require Vencord. Native installs normally
+use the standard socket in `$XDG_RUNTIME_DIR` (or the configured temp directory).
+The core also checks common Flatpak and Snap socket layouts. User-configured
+paths are tried first, and the built-in fallback list is still searched.
+
+The Discord client must be running and expose its local RPC endpoint. Some
+alternative clients require their RPC/arRPC integration to be enabled in the
+client's own settings. A browser-only Discord tab is not a local desktop IPC
+server. See [the client compatibility guide](docs/discord-client-compatibility.md)
+for exact support boundaries and diagnostics.
+
 ## Components
 
 ### Core publisher
@@ -81,6 +96,12 @@ The manager arbitrates live activities by priority. The bundled defaults put
 audio CD above Minecraft, so a disc session wins while it is present and the
 Minecraft activity becomes visible again when the disc provider disconnects.
 The socket has mode `0600`; it is local to the user.
+
+The manager speaks Discord's standard local RPC-over-IPC protocol. It does not
+use Vencord APIs, a browser extension, or a game-scanning plugin. Any compatible
+Linux desktop client that exposes the local IPC socket can receive provider
+activities. See [Discord client compatibility](docs/discord-client-compatibility.md)
+for native, Flatpak, Vesktop, Snap, and troubleshooting notes.
 
 The systemd socket can remain enabled. That is not the same as keeping a
 polling daemon resident: systemd holds the listening socket and starts the
@@ -215,7 +236,7 @@ The important top-level settings are:
 | Setting | Purpose |
 | --- | --- |
 | `client_id` | Your Discord application's public Application ID |
-| `ipc_socket_candidates` | Discord/Vesktop local IPC socket locations |
+| `ipc_socket_candidates` | Preferred local Discord IPC socket paths; portable built-in fallbacks are always tried |
 | `idle_exit_seconds` | Grace period before the empty manager exits |
 | `priorities` | Relative priority of each provider |
 | `assets` | Discord Rich Presence asset keys |
@@ -232,7 +253,7 @@ The project targets Linux desktops with user systemd and Unix sockets.
 
 | Feature | Required | Optional / fallback |
 | --- | --- | --- |
-| Core | Python 3.10+; Discord or Vesktop with local IPC | systemd user socket activation |
+| Core | Python 3.10+; a compatible Discord desktop client exposing local RPC/IPC; Linux user systemd | Known native, Flatpak, and Snap socket paths are auto-discovered; custom paths can be added |
 | Audio-CD detection | Linux optical drive and kernel CD-ROM ioctls | `cd-info` fallback |
 | CD metadata | Network access for MusicBrainz | Cached/local CD-Text works offline |
 | CD playback | A CD-capable player such as mpv | Existing desktop audio-CD player |
@@ -264,7 +285,7 @@ tools/
   assets/bin/           generic image packer and built-in artwork generator
 config/                 shared example configuration
 legacy/                 superseded direct-RPC bridge, retained for migration
-docs/                   architecture and lifecycle notes
+docs/                   architecture, client compatibility, and hardware notes
 tests/                  offline regression tests
 ```
 
@@ -321,8 +342,11 @@ roaring-minecraft-presence --demo --once --dry-run
 journalctl --user -u roaring-minecraft-presence -f
 ```
 
-If the Discord socket is missing, start Discord/Vesktop first and compare its
-IPC path with `ipc_socket_candidates`. If no activity appears, check the
+If the Discord socket is missing, start your desktop Discord client and run
+`roaring-presence-doctor`. The manager checks the standard XDG/temp paths and
+common sandbox locations. Add a custom path to `ipc_socket_candidates` only if
+your client uses a nonstandard socket. See the compatibility guide if no
+socket is found. If no activity appears, check the
 manager endpoint with `roaring-presence-doctor`, optionally query it with
 `roaring-presence-doctor --query-manager`, and verify your Application ID.
 For CD images, confirm the asset key in the Developer Portal exactly matches
