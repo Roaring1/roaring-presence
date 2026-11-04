@@ -133,6 +133,17 @@ maintainer's Nobara/KDE desktop.
     process, and no Discord activity winner. This confirmed a clean
     eject/reinsert cycle without stale session state.
 
+**Second audio-CD smoke test**
+
+A second disc was inserted later in the same session. The kernel reported 17
+audio tracks. MusicBrainz resolved the album *Songs Children Love to Sing*;
+the provider published track 1, “This-A-Way That-A-Way,” then track 2,
+“Miss Mary Mack.” Release and release-group artwork lookups both returned
+HTTP 404, which was logged as an optional artwork miss rather than a playback
+failure. The player was closed normally and systemd recorded a successful
+service exit. This provides a second-disc audio/metadata smoke test; it is not
+a data-disc or ISO9660 compatibility result.
+
 **Control-surface coverage and limits**
 
 The player source confirms that the visible Next button calls
