@@ -87,17 +87,60 @@ The legacy Vesktop-to-Prism IPC bridge was left enabled during validation. It
 preserves the pre-existing Minecraft/Essential Mod integration and was not
 disabled.
 
-## Current lifecycle validation checklist
+## Single-owner lifecycle validation — 2026-11-04
 
-The simplified implementation still needs a real inserted-disc run confirming:
+A real-drive test of the simplified implementation was completed on the
+maintainer's Nobara/KDE desktop.
 
-- the single per-drive user unit opens one player window;
-- Play starts mpv; pause clears Discord; resume restores it;
-- the visible next-track button advances the CD and updates Discord;
-- KDE taskbar Next/Previous/PlayPause reach the in-process MPRIS interface;
-- closing the window stops mpv and ends the per-disc service;
-- eject stops playback, clears Discord, and releases the MPRIS name;
-- no transient `roaring-cd-autoplay-*.scope` units or detached eject processes
-  are created.
+**Hardware and runtime**
 
-Hardware-dependent checks should be recorded separately from CI results.
+- Optical drive: HL-DT-ST DVDRAM GP60NB50 (`/dev/sr0`).
+- Audio CD: *Alabama & Friends*, 11 audio tracks.
+- KDE Plasma, PipeWire 1.4.11, and Vesktop Flatpak Discord IPC.
+- The owner muted audio externally for the playback test; software volume and
+  mute settings were not changed by the test.
+
+**Observed results**
+
+1. Insertion at 03:32:10 PST started exactly one
+   `roaring-cd-presence@sr0.service`. The provider found all 11 audio tracks,
+   resolved cached MusicBrainz metadata and cover art, registered the player
+   with MPRIS, and connected to the manager.
+2. Before Play, MPRIS reported `Stopped` with empty track metadata, no mpv
+   playback process existed, the CD provider was `live: false`, and the
+   manager had no activity winner. The provider logged
+   `playback inactive; clearing CD activity`.
+3. MPRIS Play started mpv with `cdda://` on the per-drive
+   `roaring-cd-mpv-sr0.sock` IPC socket. MPRIS changed to `Playing`, and
+   Discord connected through the Vesktop Flatpak IPC socket.
+4. Track 1 was identified as “Tennessee River” and published. The manager
+   reported the CD provider as the activity winner.
+5. MPRIS Pause changed playback to `Paused`; the provider became
+   `live: false`, the manager winner became `null`, and Discord received an
+   explicit cleared activity. mpv remained owned by the player for resume.
+6. MPRIS Play resumed playback and restored CD activity.
+7. MPRIS Next advanced from track 1 (“Tennessee River”) to track 2
+   (“Love In the First Degree”), and the new track was published to Discord.
+8. MPRIS Quit ended the complete session successfully. The provider logged
+   `player closed; ending the CD session`; systemd reported exit status 0;
+   the mpv process ended; the MPRIS service name disappeared; and the manager
+   published a final clear and removed the CD provider.
+9. The physical eject command used by the GUI action (`eject /dev/sr0`) was
+   run against the real drive. The drive stopped reporting inserted media and
+   the CD service remained inactive.
+10. Reinsertion at 03:37:36 PST started a fresh per-drive session. The new
+    player reported `Stopped`, `CanPlay=true`, empty metadata, no mpv
+    process, and no Discord activity winner. This confirmed a clean
+    eject/reinsert cycle without stale session state.
+
+**Control-surface coverage and limits**
+
+The player source confirms that the visible Next button calls
+`service.skip(1)`, and the visible Eject button calls `service.eject()`.
+The equivalent MPRIS Next operation and the underlying eject executable/device
+operation were exercised successfully. The physical GUI button clicks
+themselves were not automated, and the KDE taskbar's visual controls were not
+separately clicked during this run.
+
+The live hardware sequence is separate from CI results. No release tag was
+created as part of this validation.
