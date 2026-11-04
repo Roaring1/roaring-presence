@@ -199,7 +199,6 @@ class _SgIoHdr(ctypes.Structure):
         ("info", ctypes.c_uint),
     ]
 
-
 def _read_toc_format(fd: int, fmt: int, length: int, timeout_ms: int) -> bytes:
     """One READ TOC/PMA/ATOC command, returning only the bytes the drive sent."""
     cdb = struct.pack(
@@ -397,8 +396,7 @@ def read_disc(
                 ["cd-info", "-q", "--no-header", "--no-device-info", device],
                 capture_output=True,
                 text=True,
-                timeout=timeout,
-            ).stdout
+                timeout=timeout,            ).stdout
             break
         except subprocess.TimeoutExpired:
             log.warning(
@@ -597,7 +595,6 @@ def caa_front(kind: str, mbid: str):
 
 def resolve_metadata(disc: dict, use_caa: bool) -> dict:
     """Artist / album / track titles / cover art, cached per Disc ID.
-
     CD-Text is authoritative when present; MusicBrainz fills the gaps.  Lookup
     order: exact Disc ID, then a CD-Text search, then cover art from the
     release and finally its release-group (many releases have no art of their
@@ -797,8 +794,7 @@ def find_playing_paths() -> list:
                 )
                 continue
             if any(player in name for player in PLAYER_NAMES) or "cdda" in " ".join(argv):
-                candidates.append(proc)
-        except (psutil.Error, TypeError):
+                candidates.append(proc)        except (psutil.Error, TypeError):
             continue
 
     if not found:
@@ -997,8 +993,7 @@ def pick_title(number: int, titles: dict, mb_titles: dict, fallback=None):
     "CD-Text name (MusicBrainz name)".
     """
     cdtext = (titles.get(number) or "").strip()
-    online = (
-        mb_titles.get(number) or mb_titles.get(str(number)) or ""
+    online = (        mb_titles.get(number) or mb_titles.get(str(number)) or ""
     ).strip()
 
     cd_real = cdtext and not is_placeholder_title(cdtext, number)
@@ -1197,8 +1192,7 @@ def stop_autoplay() -> None:
         if line.strip().startswith("roaring-cd-autoplay-")
     ]
     if not units:
-        return
-    try:
+        return    try:
         subprocess.run(
             ["systemctl", "--user", "stop"] + units,
             capture_output=True,
@@ -1338,8 +1332,9 @@ def observe_playback(disc: dict, cfg: dict) -> dict:
     players = find_playing_paths()
     if not players:
         return observation
-    observation["playing"] = True
-
+    # A process holding an audiocd path only proves that a player opened
+    # the disc. It does NOT prove that audio is reaching the listener.
+    # Require a positive live-playing signal before advertising presence.
     mpv = mpv_query(
         expand(str(cd_cfg.get("mpv_ipc_socket") or "")), ["time-pos", "pause", "path"]
     )
@@ -1355,8 +1350,11 @@ def observe_playback(disc: dict, cfg: dict) -> dict:
                 break
     if matched is not None:
         chosen = matched
-        if mpv.get("pause") is not None:
-            observation["paused"] = bool(mpv["pause"])
+        # mpv's pause property is authoritative for the matching stream.
+        # Missing state is treated as unknown, never as proof of playback.
+        if isinstance(mpv.get("pause"), bool):
+            observation["paused"] = mpv["pause"]
+            observation["playing"] = not observation["paused"]
         position = mpv.get("time-pos")
     else:
         position = None
@@ -1366,8 +1364,27 @@ def observe_playback(disc: dict, cfg: dict) -> dict:
                 mpv_path,
                 chosen["path"],
             )
+        # Other supported players expose their transport state through
+        # MPRIS. A process/path match alone is insufficient: require
+        # playerctl to positively report Playing. Fail closed if unavailable.
+        player_name = os.path.basename(chosen.get("path") or "").lower()
+        try:
+            status = subprocess.run(
+                ["playerctl", "--player", player_name, "status"],
+                capture_output=True, text=True, timeout=1.5, check=False,
+            )
+            if status.returncode == 0:
+                observation["playing"] = status.stdout.strip().lower() == "playing"
+                observation["paused"] = status.stdout.strip().lower() == "paused"
+        except (OSError, subprocess.SubprocessError):
+            pass
     if len(players) > 1:
         log.debug("%d players on this disc; following pid %s", len(players), chosen["pid"])
+
+    # Never publish an idle, paused, preloaded, or indeterminate session.
+    if observation["playing"] is not True:
+        observation["track"] = None
+        return observation
 
     parsed = parse_audiocd_name(chosen["path"])
     observation["file_artist"] = parsed["artist"]
@@ -1397,7 +1414,6 @@ def observe_playback(disc: dict, cfg: dict) -> dict:
     ):
         observation["preloaded"] = True
         return observation
-
     # Whole-disc stream (Full CD.wav, cdda://): map absolute position via TOC.
     if isinstance(position, (int, float)) and toc and leadout is not None:
         number = track_at_position(toc, float(position))
@@ -1597,7 +1613,6 @@ def main(argv: list) -> int:
     track_since = session_start
     last_push = 0.0
     last_elapsed = None
-
     def push(activity) -> None:
         link.send({"provider": "cd", "priority": priority, "activity": activity})
 
@@ -1609,6 +1624,37 @@ def main(argv: list) -> int:
         while True:
             state = observe_playback(disc, cfg)
             now = time.time()
+
+            # Discord presence is strictly PLAY-only. Clear the CD provider
+            # as soon as playback stops or pauses; merely having the disc
+            # mounted/open/preloaded must never advertise a song.
+            if state.get("playing") is not True or state.get("paused"):
+                if published != "__inactive__":
+                    log.info("CD is not actively playing; clearing Discord activity")
+                    push(None)
+                    published = "__inactive__"
+                if args.once:
+                    return 0
+                window = idle_interval
+                deadline = time.monotonic() + window
+                ejected = None
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(1.0, max(0.05, remaining)))
+                    status = drive_status(device)
+                    if status in (CDS_NO_DISC, CDS_TRAY_OPEN):
+                        time.sleep(0.4)
+                        if drive_status(device) in (CDS_NO_DISC, CDS_TRAY_OPEN):
+                            ejected = status
+                            break
+                if ejected is not None:
+                    log.info("disc ejected (status %s); stopping playback", ejected)
+                    stop_autoplay()
+                    return 0
+                continue
+
             if state.get("track") != last_track:
                 # New track: restart the clock instead of inheriting the old
                 # track's start time.
