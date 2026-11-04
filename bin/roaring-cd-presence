@@ -795,7 +795,8 @@ def find_playing_paths() -> list:
                 )
                 continue
             if any(player in name for player in PLAYER_NAMES) or "cdda" in " ".join(argv):
-                candidates.append(proc)        except (psutil.Error, TypeError):
+                candidates.append(proc)
+        except (psutil.Error, TypeError):
             continue
 
     if not found:
