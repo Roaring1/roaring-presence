@@ -788,6 +788,7 @@ def find_playing_paths() -> list:
                 found.append(
                     {
                         "pid": proc.pid,
+                        "name": name,
                         "path": hit,
                         "started": proc.info.get("create_time") or 0.0,
                     }
@@ -805,6 +806,7 @@ def find_playing_paths() -> list:
                         found.append(
                             {
                                 "pid": proc.pid,
+                                "name": (proc.info.get("name") or "").lower(),
                                 "path": handle.path,
                                 "started": proc.create_time(),
                             }
@@ -1367,7 +1369,7 @@ def observe_playback(disc: dict, cfg: dict) -> dict:
         # Other supported players expose their transport state through
         # MPRIS. A process/path match alone is insufficient: require
         # playerctl to positively report Playing. Fail closed if unavailable.
-        player_name = os.path.basename(chosen.get("path") or "").lower()
+        player_name = (chosen.get("name") or "").lower()
         try:
             status = subprocess.run(
                 ["playerctl", "--player", player_name, "status"],
