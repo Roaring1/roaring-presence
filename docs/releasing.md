@@ -1,8 +1,7 @@
 # Maintainer release procedure
 
-This repository currently has an open development PR and no versioned release.
-Do not create a release tag from a feature branch. A release is cut from a
-reviewed commit on the default branch after the checks below pass.
+Create releases only from a reviewed commit on the default branch after the
+checks below pass. Do not create a release tag from a feature branch.
 
 ## 1. Prepare the candidate
 

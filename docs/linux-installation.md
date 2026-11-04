@@ -67,7 +67,7 @@ Package names can vary by distribution release.
 ### Fedora, Nobara and related DNF systems
 
 ```bash
-sudo dnf install mpv python3-pyqt6 eject
+sudo dnf install mpv python3-pyqt6 util-linux
 ```
 
 Optional artwork tools:

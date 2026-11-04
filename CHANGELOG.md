@@ -1,23 +1,46 @@
 # Changelog
 
-Notable user-facing changes are recorded here. This project has not published a
-versioned release yet; unreleased work remains under **Unreleased** until a tag
-is created.
+Notable user-facing changes are recorded here.
 
 ## Unreleased
 
-- Split audio-CD playback from Discord Rich Presence. The standalone `cd-player`
-  profile has no Discord core, client, IPC or Application ID dependency.
-- Added a Discord-enabled CD profile that reuses the standalone CD session
-  engine, plus separate user services and opt-in udev activation.
-- Standardized installation on XDG directories and `~/.local/bin`, with
-  absolute desktop/service executable paths and compatibility symlinks for
-  existing `~/bin` commands.
-- Added a GitHub-branch updater that checks for clean/fast-forward state,
-  verifies new code in an isolated worktree, tests it, and refreshes only the
-  selected components.
-- Improved component-aware diagnostics, audio-backend fallback, optional Qt
-  UI handling, generic Discord IPC discovery, and distro installation docs.
-- Expanded the offline regression and installer test suite and CI matrix to
-  Python 3.10, 3.12 and 3.14.
-- Adopted the MIT License for original project code and documentation.
+No unreleased changes.
+
+## v0.1.0 — 2026-11-04
+
+- Initial public release of the modular Linux audio-CD player with optional
+  Discord Rich Presence, Minecraft activity, and local artwork tools.
+- Split audio-CD playback from Discord publishing. The standalone
+  `cd-player` profile needs no Discord client, IPC socket, core service, or
+  Application ID; the optional `audio-cd` profile adds presence to the same
+  single-owner player session.
+- Simplified CD lifecycle ownership: one per-disc session owns the player,
+  mpv child, MPRIS registration, and eject handling. Discord activity appears
+  only during confirmed unpaused CD playback and clears on pause, stop, close,
+  eject, and teardown.
+- Added per-drive mpv IPC sockets, safe migration of legacy configuration and
+  installed helper files, and a branch-pinned updater that tests fast-forward
+  updates before installing the selected component profile.
+- Added component-scoped diagnostics, distro installation guidance,
+  compatibility notes, support/security instructions, and MIT licensing.
+- CI passes on Python 3.10, 3.12, and 3.14. The offline suite contains 54
+  regression tests.
+- Real-drive validation on Nobara/KDE used an HL-DT-ST DVDRAM GP60NB50 with
+  two audio CDs (11 and 17 tracks), and Vesktop Flatpak for Discord IPC.
+  Playback, pause/resume presence clearing/restoration, track changes, session
+  close, physical eject, and eject/reinsert were verified.
+
+### Known limitations
+
+- KDE Plasma's taskbar has been observed to grey out its Next/Previous controls
+  even while the player UI works and KDE's MPRIS model reads the advertised
+  capabilities as available. Direct MPRIS calls work; the taskbar-specific
+  mismatch was not reproduced in the isolated headless test and has no
+  confirmed root cause.
+- Only Vesktop Flatpak has been exercised end-to-end for Discord publishing
+  on the maintainer's desktop. Native Discord, official Discord Flatpak,
+  Snap, other desktops, and non-Fedora distributions are not all hardware-
+  validated.
+- The hardware run exercised the Discord-enabled player profile. The
+  standalone profile is covered by CI installer/smoke tests but has not had a
+  separate physical-drive acceptance run.

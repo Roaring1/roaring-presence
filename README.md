@@ -13,7 +13,7 @@ daemon:
 On Fedora/Nobara, install the audio-CD player dependencies:
 
 ```bash
-sudo dnf install mpv python3-pyqt6
+sudo dnf install mpv python3-pyqt6 util-linux
 
 git clone https://github.com/Roaring1/roaring-presence.git
 cd roaring-presence
@@ -315,6 +315,20 @@ The project targets Linux desktops with user systemd and Unix sockets.
 No telemetry is sent. Audio-CD metadata lookup contacts MusicBrainz and, when
 enabled, the Cover Art Archive. Presence is sent to the local Discord/Vesktop
 IPC endpoint; the application does not need a Discord bot token.
+
+## Known limitations
+
+On KDE Plasma, the taskbar may show Next/Previous as disabled even while the
+player window works and KDE's MPRIS model reports those capabilities as
+available. Direct MPRIS Next/Previous calls work; the taskbar-specific
+mismatch has no confirmed cause. Use the player's own Next button when the
+panel does not offer track skipping. This does not affect playback or Discord
+track updates.
+
+Only Vesktop Flatpak has been exercised end-to-end for Discord publishing on
+the maintainer's desktop. See the
+[client compatibility guide](docs/discord-client-compatibility.md) for
+untested client/package combinations.
 
 ## Repository map
 
