@@ -43,14 +43,6 @@ MINECRAFT = load_module(
     ROOT / "providers/minecraft/bin/roaring-minecraft-presence",
 )
 CD = load_module("roaring_presence_cd_test", ROOT / "providers/audio-cd/bin/roaring-cd-presence")
-CD_AUTOPLAY = load_module(
-    "roaring_presence_cd_autoplay_test",
-    ROOT / "providers/audio-cd/bin/roaring-cd-autoplay",
-)
-CD_PATHS = load_module(
-    "roaring_presence_cd_paths_test",
-    ROOT / "providers/audio-cd/bin/cd_paths.py",
-)
 
 PIL_AVAILABLE = importlib.util.find_spec("PIL") is not None
 if PIL_AVAILABLE:
@@ -275,6 +267,24 @@ class MinecraftTests(unittest.TestCase):
 
 
 class AudioCdPlayerIntegrationTests(unittest.TestCase):
+    def test_session_stops_leftover_owned_process_group_after_player_crash(self):
+        process = mock.Mock()
+        process.pid = 4321
+        process.poll.return_value = 23
+        with mock.patch.object(CD.os, "killpg") as killpg, \
+             mock.patch.object(CD.time, "sleep") as sleep:
+            CD.stop_player(process)
+        self.assertEqual(
+            killpg.call_args_list,
+            [
+                mock.call(4321, 0),
+                mock.call(4321, CD.signal.SIGTERM),
+                mock.call(4321, CD.signal.SIGKILL),
+            ],
+        )
+        sleep.assert_called_once_with(0.25)
+        process.wait.assert_not_called()
+
     def test_player_only_session_does_not_construct_discord_manager_link(self):
         with mock.patch.object(CD, "ManagerLink") as manager_link:
             self.assertIsNone(CD.manager_link_for_mode(player_only=True))
@@ -287,56 +297,68 @@ class AudioCdPlayerIntegrationTests(unittest.TestCase):
         self.assertIs(result, manager_link.return_value)
         manager_link.return_value.connect.assert_called_once_with()
 
-    def test_mpv_stream_has_kde_task_identity_when_pulse_is_available(self):
-        help_output = "Available audio outputs:\n  pipewire         PipeWire output\n  pulse            PulseAudio output\n  alsa             ALSA output\n"
-        with mock.patch.object(
-            CD_AUTOPLAY.subprocess, "run",
-            return_value=SimpleNamespace(stdout=help_output, stderr=""),
-        ):
-            argv = CD_AUTOPLAY.mpv_argv("/dev/sr0", 2)
-        self.assertIn("--ao=pulse", argv)
-        self.assertIn("--audio-client-name=Audio CD", argv)
-        self.assertIn("--cdda-device=/dev/sr0", argv)
+    def test_cd_ipc_socket_is_private_per_drive_and_preserves_custom_paths(self):
+        socket0 = CD.mpv_socket_path("/dev/sr0")
+        socket1 = CD.mpv_socket_path("/dev/sr1")
+        self.assertNotEqual(socket0, socket1)
+        self.assertTrue(socket0.endswith("roaring-cd-mpv-sr0.sock"))
+        self.assertTrue(socket1.endswith("roaring-cd-mpv-sr1.sock"))
+        self.assertEqual(
+            CD.mpv_socket_path("/dev/sr1", "$XDG_RUNTIME_DIR/mpv-ipc.sock"),
+            socket1,
+        )
+        self.assertEqual(
+            CD.mpv_socket_path("/dev/sr1", "/tmp/my-custom-cd.sock"),
+            "/tmp/my-custom-cd.sock",
+        )
+        player_source = (CD_BIN / "roaring-cd-player").read_text(encoding="utf-8")
+        self.assertIn("def mpv_socket_path(", player_source)
 
-    def test_mpv_uses_default_backend_when_pulse_is_unavailable(self):
-        with mock.patch.object(
-            CD_AUTOPLAY.subprocess, "run",
-            return_value=SimpleNamespace(stdout="Available audio outputs:\n  pipewire         PipeWire output\n  alsa ALSA output\n", stderr=""),
-        ):
-            argv = CD_AUTOPLAY.mpv_argv("/dev/sr0", None)
-        self.assertIn("--ao=auto", argv)
-        self.assertNotIn("--audio-client-name=Audio CD", argv)
+    def test_session_launches_its_sibling_player_without_a_systemd_scope(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(CD.subprocess, "Popen", return_value=SimpleNamespace(pid=123)) as popen, \
+             mock.patch.dict(os.environ, {"XDG_CACHE_HOME": tmp}):
+            process = CD.launch_player({"device": "/dev/sr0", "tracks": []})
 
-    def test_autoplay_respects_xdg_config_home_for_player_ui_setting(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / "roaring-presence/config.json"
-            config.parent.mkdir(parents=True)
-            config.write_text('{"cd":{"player_ui":false}}\n', encoding="utf-8")
-            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}, clear=False):
-                with mock.patch.dict(os.environ, {"ROARING_CD_NO_PLAYER": "0"}):
-                    self.assertFalse(CD_AUTOPLAY.player_enabled())
+        binary = str((CD_BIN / "roaring-cd-player").resolve())
+        self.assertEqual(process.pid, 123)
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[:3], [binary, "--device", "/dev/sr0"])
+        self.assertIn("--json", argv)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertNotIn("systemd-run", argv)
+        self.assertNotIn("roaring-cd-autoplay", " ".join(argv))
 
-    def test_player_ui_is_optional_when_qtdbus_is_missing(self):
-        with mock.patch.object(CD_AUTOPLAY.importlib.util, "find_spec", return_value=None):
-            self.assertFalse(CD_AUTOPLAY.player_ui_available())
+    def test_standalone_session_waits_for_player_without_observing_mpv(self):
+        process = mock.Mock()
+        process.wait.return_value = 0
+        process.poll.return_value = 0
+        process.pid = 123
+        with mock.patch.object(CD.os, "killpg", side_effect=ProcessLookupError) as killpg:
+            CD.wait_for_player(process)
+        process.wait.assert_called_once_with()
+        killpg.assert_called_once_with(123, 0)
 
-    def test_companion_commands_resolve_from_local_bin_without_path(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp)
-            local_bin = home / ".local/bin"
-            local_bin.mkdir(parents=True)
-            for name in ("roaring-cd-player", "roaring-cd-autoplay"):
-                executable = local_bin / name
-                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-                executable.chmod(0o755)
-            with mock.patch.dict(os.environ, {"HOME": str(home)}), \
-                 mock.patch.object(CD_PATHS.shutil, "which", return_value=None):
-                self.assertEqual(CD_PATHS.installed_program("roaring-cd-player"), str(local_bin / "roaring-cd-player"))
-                self.assertEqual(CD_PATHS.installed_program("roaring-cd-autoplay"), str(local_bin / "roaring-cd-autoplay"))
+    def test_standalone_session_propagates_unexpected_player_exit(self):
+        process = mock.Mock()
+        process.wait.return_value = 7
+        process.poll.return_value = 7
+        process.returncode = 7
+        process.pid = 123
+        with mock.patch.object(CD.os, "killpg", side_effect=ProcessLookupError):
+            result = CD.wait_for_player(process)
+        self.assertEqual(result, 7)
 
-    def test_standalone_session_entry_point_exposes_player_help(self):
+    def test_session_stops_and_reaps_only_its_player_child(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        CD.stop_player(process)
+        process.terminate.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=5.5)
+
+    def test_player_only_entry_point_exposes_help_without_launching_a_disc(self):
         result = subprocess.run(
-            [str(ROOT / "providers/audio-cd/bin/roaring-cd-session"), "--help"],
+            [str(CD_BIN / "roaring-cd-presence"), "--player-only", "--help"],
             capture_output=True, text=True, timeout=10,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -418,6 +440,47 @@ class AudioCdMetadataTests(unittest.TestCase):
         self.assertEqual(saved["cover"], cover)
         self.assertTrue(saved["cover_art_checked"])
 
+    def test_activity_is_absent_when_idle_or_paused(self):
+        metadata = {"mb_album": "Example Album", "mb_artist": "Example Artist"}
+        config = {"assets": {"cd": "cd", "play": "play", "pause": "pause"}}
+        for state in (
+            {"playing": False, "paused": False},
+            {"playing": True, "paused": True},
+            {"playing": None, "paused": False},
+        ):
+            with self.subTest(state=state):
+                self.assertIsNone(CD.build_activity(self.disc, metadata, config, state))
+
+    def test_activity_exists_only_for_confirmed_unpaused_playback(self):
+        activity = CD.build_activity(
+            self.disc,
+            {"mb_album": "Example Album", "mb_artist": "Example Artist", "mb_titles": {1: "Opening"}},
+            {"assets": {"cd": "cd", "play": "play"}},
+            {"track": 1, "playing": True, "paused": False, "elapsed": 15, "length": 198},
+        )
+        self.assertIsNotNone(activity)
+        self.assertEqual(activity["details"], "Opening")
+
+    def test_observer_fails_closed_for_missing_or_paused_mpv_state(self):
+        for mpv_state in (
+            {},
+            {"path": "cdda://", "pause": True, "time-pos": 0},
+            {"path": "cdda://", "pause": None, "time-pos": 10},
+        ):
+            with self.subTest(mpv_state=mpv_state), mock.patch.object(CD, "mpv_query", return_value=mpv_state):
+                state = CD.observe_playback(self.disc, {"cd": {"mpv_ipc_socket": "/tmp/fake.sock"}})
+            self.assertFalse(state["playing"])
+            self.assertIsNone(CD.build_activity(self.disc, {}, {}, state))
+
+    def test_observer_maps_confirmed_mpv_position_to_track(self):
+        mpv_state = {"path": "cdda://", "pause": False, "time-pos": 20.0}
+        with mock.patch.object(CD, "mpv_query", return_value=mpv_state):
+            state = CD.observe_playback(self.disc, {"cd": {"mpv_ipc_socket": "/tmp/fake.sock"}})
+        self.assertTrue(state["playing"])
+        self.assertFalse(state["paused"])
+        self.assertEqual(state["track"], 1)
+        self.assertAlmostEqual(state["elapsed"], 18.0)
+
     def test_resolved_cover_url_wins_over_generic_cd_asset(self):
         cover = "https://coverartarchive.org/release/example/front-500.jpg"
         activity = CD.build_activity(
@@ -492,20 +555,56 @@ class DoctorTests(unittest.TestCase):
         finally:
             DOCTOR.CONFIG_PATH = old_config
 
-    def test_cd_player_doctor_treats_psutil_as_required_for_tracking(self):
+    def test_cd_player_doctor_does_not_require_psutil(self):
         old_config = DOCTOR.CONFIG_PATH
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 DOCTOR.CONFIG_PATH = Path(tmp) / "no-config.json"
+
                 def module_available(name):
                     return name != "psutil"
+
+                with mock.patch.object(DOCTOR, "check_command"), \
+                     mock.patch.object(DOCTOR, "python_module_available", side_effect=module_available), \
+                     mock.patch.object(DOCTOR, "mpv_protocols", return_value={"cdda"}), \
+                     mock.patch.object(DOCTOR, "mpv_audio_outputs", return_value={"pulse"}):
+                    results, summary = DOCTOR.run(component="cd-player")
+            self.assertEqual(summary["errors"], 0)
+            self.assertFalse(any("psutil" in item["message"] for item in results))
+        finally:
+            DOCTOR.CONFIG_PATH = old_config
+
+    def test_cd_player_doctor_checks_for_the_eject_command(self):
+        old_config = DOCTOR.CONFIG_PATH
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                DOCTOR.CONFIG_PATH = Path(tmp) / "no-config.json"
+                with mock.patch.object(DOCTOR, "check_command") as check_command, \
+                     mock.patch.object(DOCTOR, "python_module_available", return_value=True), \
+                     mock.patch.object(DOCTOR, "mpv_protocols", return_value={"cdda"}), \
+                     mock.patch.object(DOCTOR, "mpv_audio_outputs", return_value={"pulse"}):
+                    DOCTOR.run(component="cd-player")
+            names = [call.args[1] for call in check_command.call_args_list]
+            self.assertIn("eject", names)
+        finally:
+            DOCTOR.CONFIG_PATH = old_config
+
+    def test_cd_player_doctor_requires_qtdbus_for_mpris_controls(self):
+        old_config = DOCTOR.CONFIG_PATH
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                DOCTOR.CONFIG_PATH = Path(tmp) / "no-config.json"
+
+                def module_available(name):
+                    return name != "PyQt6.QtDBus"
+
                 with mock.patch.object(DOCTOR, "check_command"), \
                      mock.patch.object(DOCTOR, "python_module_available", side_effect=module_available), \
                      mock.patch.object(DOCTOR, "mpv_protocols", return_value={"cdda"}), \
                      mock.patch.object(DOCTOR, "mpv_audio_outputs", return_value={"pulse"}):
                     results, summary = DOCTOR.run(component="cd-player")
             self.assertEqual(summary["errors"], 1)
-            self.assertTrue(any("psutil" in item["message"] and item["level"] == "error" for item in results))
+            self.assertTrue(any("QtDBus" in item["message"] and item["level"] == "error" for item in results))
         finally:
             DOCTOR.CONFIG_PATH = old_config
 
@@ -655,11 +754,50 @@ class ProjectMetadataTests(unittest.TestCase):
 
 
 class InstallerSmokeTests(unittest.TestCase):
-    def run_installer(self, *args):
+    def run_installer(self, *args, seed_legacy=False, seed_config=False):
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
         home = root / "home"
         home.mkdir()
+        if seed_config:
+            config_dir = root / "xdg-config/roaring-presence"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.json").write_text(
+                json.dumps({
+                    "client_id": "preserve-this-id",
+                    "assets": {"cd": "custom-cd", "minecraft": "custom-world"},
+                    "cd": {
+                        "mpv_ipc_socket": "$XDG_RUNTIME_DIR/mpv-ipc.sock",
+                        "autoplay_prompt": True,
+                        "preload": True,
+                        "preload_idle_seconds": 60,
+                        "idle_poll_seconds": 6,
+                        "player_ui": True,
+                        "player_poll_seconds": 1,
+                        "player_idle_poll_seconds": 3,
+                        "progress_drift_seconds": 4.0,
+                        "links": {"track": "https://example.test/%(query)s"},
+                    },
+                    "minecraft": {"poll_seconds": 17, "show_world": False},
+                }, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            (config_dir / "config.json").chmod(0o600)
+        if seed_legacy:
+            local_bin = home / ".local/bin"
+            local_bin.mkdir(parents=True)
+            managed = {
+                "roaring-cd-autoplay": '#!/usr/bin/env python3\n"""roaring-cd-autoplay -- extremely minimal"""\n',
+                "roaring-cd-session": '#!/usr/bin/env python3\n"""Standalone audio-CD session entry point"""\n',
+                "cd_paths.py": '"""Small shared path helpers for the standalone audio-CD tools."""\n',
+            }
+            for name, content in managed.items():
+                (local_bin / name).write_text(content, encoding="utf-8")
+            (local_bin / "user-owned-tool").write_text("do not remove\n", encoding="utf-8")
+            legacy_bin = home / "bin"
+            legacy_bin.mkdir()
+            for name in managed:
+                (legacy_bin / name).symlink_to(local_bin / name)
         fake_bin = root / "fake-bin"
         fake_bin.mkdir()
         systemctl = fake_bin / "systemctl"
@@ -690,17 +828,20 @@ class InstallerSmokeTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         bin_dir = home / ".local/bin"
         config_root = root / "xdg-config"
-        self.assertTrue((bin_dir / "roaring-cd-session").is_file())
+        self.assertTrue((bin_dir / "roaring-cd-presence").is_file())
         self.assertTrue((bin_dir / "roaring-cd-player").is_file())
+        self.assertFalse((bin_dir / "roaring-cd-session").exists())
+        self.assertFalse((bin_dir / "roaring-cd-autoplay").exists())
+        self.assertFalse((bin_dir / "cd_paths.py").exists())
         self.assertTrue((bin_dir / "roaring-presence-doctor").is_file())
         self.assertFalse((bin_dir / "roaring-presenced").exists())
         self.assertFalse((config_root / "roaring-presence/config.json").exists())
         self.assertTrue((config_root / "systemd/user/roaring-cd-player@.service").is_file())
         self.assertIn("roaring-presence-doctor --component cd-player", result.stdout)
-        self.assertIn("roaring-cd-session /dev/sr0", result.stdout)
+        self.assertIn("roaring-cd-presence --player-only /dev/sr0", result.stdout)
         self.assertFalse((config_root / "systemd/user/roaring-presenced.socket").exists())
         desktop = (home / ".local/share/applications/roaring-cd-player.desktop").read_text(encoding="utf-8")
-        self.assertIn(f"Exec={bin_dir}/roaring-cd-player", desktop)
+        self.assertIn(f"Exec={bin_dir}/roaring-presence-scan --player-only", desktop)
         self.assertNotIn("@ROARING_PRESENCE_EXEC@", desktop)
         updater = bin_dir / "roaring-presence-update"
         self.assertTrue(updater.is_file())
@@ -712,11 +853,71 @@ class InstallerSmokeTests(unittest.TestCase):
         self.assertIn("VERIFY_DIR", updater_source)
         self.assertIn("PROFILE_ARGS=(--component cd-player", updater_source)
         self.assertIn("UPDATE_CD_MODE=player", updater_source)
-        self.assertIn("providers/audio-cd/bin/roaring-cd-session", updater_source)
-        self.assertIn("providers/audio-cd/bin/cd_paths.py", updater_source)
+        self.assertNotIn("providers/audio-cd/bin/roaring-cd-session", updater_source)
+        self.assertNotIn("providers/audio-cd/bin/cd_paths.py", updater_source)
         self.assertIn("UPDATE_MINECRAFT", updater_source)
         self.assertIn("UPDATER_TMP", (ROOT / "install.sh").read_text(encoding="utf-8"))
         self.assertIn("mv -f \"$UPDATER_TMP\"", (ROOT / "install.sh").read_text(encoding="utf-8"))
+
+    def test_upgrade_migrates_only_obsolete_cd_settings(self):
+        temporary, home, root, _result = self.run_installer(seed_config=True)
+        self.addCleanup(temporary.cleanup)
+        config = json.loads(
+            (root / "xdg-config/roaring-presence/config.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(config["client_id"], "preserve-this-id")
+        self.assertEqual(config["assets"], {"cd": "custom-cd", "minecraft": "custom-world"})
+        self.assertEqual(config["minecraft"], {"poll_seconds": 17, "show_world": False})
+        self.assertEqual(
+            config["cd"]["mpv_ipc_socket"],
+            "$XDG_RUNTIME_DIR/roaring-cd-mpv.sock",
+        )
+        self.assertEqual(config["cd"]["progress_drift_seconds"], 4.0)
+        self.assertEqual(
+            config["cd"]["links"],
+            {"track": "https://example.test/%(query)s"},
+        )
+        for obsolete in (
+            "autoplay_prompt", "preload", "preload_idle_seconds",
+            "idle_poll_seconds", "player_ui", "player_poll_seconds",
+            "player_idle_poll_seconds",
+        ):
+            self.assertNotIn(obsolete, config["cd"])
+        config_path = root / "xdg-config/roaring-presence/config.json"
+        self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
+
+    def test_upgrade_preserves_custom_mpv_socket(self):
+        temporary, home, root, _result = self.run_installer(seed_config=True)
+        self.addCleanup(temporary.cleanup)
+        config_path = root / "xdg-config/roaring-presence/config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["cd"]["mpv_ipc_socket"] = "/run/user/1000/custom-audio.sock"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        # Re-running installation is idempotent and must not replace a custom socket.
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+            "PATH": "/usr/bin:/bin",
+            "XDG_RUNTIME_DIR": str(home / "runtime"),
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent/test-bus",
+        })
+        subprocess.run(
+            ["bash", str(ROOT / "install.sh")], cwd=ROOT, env=env,
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+        migrated = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(migrated["cd"]["mpv_ipc_socket"], "/run/user/1000/custom-audio.sock")
+
+    def test_upgrade_removes_only_managed_legacy_cd_helpers(self):
+        temporary, home, _root, _result = self.run_installer(seed_legacy=True)
+        self.addCleanup(temporary.cleanup)
+        local_bin = home / ".local/bin"
+        legacy_bin = home / "bin"
+        for name in ("roaring-cd-autoplay", "roaring-cd-session", "cd_paths.py"):
+            self.assertFalse((local_bin / name).exists())
+            self.assertFalse((legacy_bin / name).exists())
+        self.assertEqual((local_bin / "user-owned-tool").read_text(encoding="utf-8"), "do not remove\n")
 
     def test_all_profile_generates_presence_aware_update_recipe(self):
         temporary, home, root, _result = self.run_installer("--component", "all")
@@ -726,6 +927,9 @@ class InstallerSmokeTests(unittest.TestCase):
         self.assertTrue((config_root / "systemd/user/roaring-presenced.socket").is_file())
         self.assertTrue((config_root / "systemd/user/roaring-cd-presence@.service").is_file())
         self.assertIn("roaring-presence-doctor --component audio-cd", _result.stdout)
+        desktop = (home / ".local/share/applications/roaring-cd-player.desktop").read_text(encoding="utf-8")
+        self.assertIn(f"Exec={bin_dir}/roaring-presence-scan\n", desktop)
+        self.assertNotIn("--player-only", desktop)
         self.assertFalse((config_root / "systemd/user/roaring-cd-player@.service").exists())
         self.assertTrue((bin_dir / "roaring-minecraft-presence").is_file())
         self.assertTrue((bin_dir / "roaring-presence-assets").is_file())

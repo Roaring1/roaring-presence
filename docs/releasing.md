@@ -42,10 +42,7 @@ python3 -m unittest discover -s tests -v
 python3 -m py_compile \\
   core/bin/roaring-presenced core/bin/roaring-presence-doctor \\
   providers/audio-cd/bin/roaring-cd-presence \\
-  providers/audio-cd/bin/roaring-cd-session \\
-  providers/audio-cd/bin/roaring-cd-autoplay \\
   providers/audio-cd/bin/roaring-cd-player \\
-  providers/audio-cd/bin/cd_paths.py \\
   providers/minecraft/bin/roaring-minecraft-presence \\
   tools/assets/bin/roaring-presence-art.py \\
   tools/assets/bin/roaring-presence-assets tests/test_regressions.py

@@ -13,8 +13,9 @@ repository does not relicense them. Relevant dependencies include:
 
 - Python (standard library)
 - mpv, with CDDA support, for audio-CD playback
-- psutil for reliable playback/process discovery
-- PyQt6 and QtDBus for the optional graphical player and MPRIS integration
+- the distribution-provided `eject` utility for tray control
+- psutil for optional process discovery in the Minecraft provider and retained legacy bridge
+- PyQt6 and QtDBus for the graphical CD player and MPRIS integration
 - Pillow for optional artwork-generation tools
 - systemd, udev, and a compatible desktop/session D-Bus environment
 - Discord-compatible desktop clients for the optional Rich Presence feature

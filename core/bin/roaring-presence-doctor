@@ -243,6 +243,7 @@ def run(query_manager: bool = False, component: str = "all") -> tuple[list[dict[
     if needs_cd:
         check_command(results, "udevadm")
         check_command(results, "mpv", required=True)
+        check_command(results, "eject", required=True)
         protocols = mpv_protocols()
         if "cdda" in protocols:
             add(results, "ok", "audio", "mpv CDDA protocol is available")
@@ -251,17 +252,14 @@ def run(query_manager: bool = False, component: str = "all") -> tuple[list[dict[
         else:
             add(results, "warning", "audio", "could not inspect mpv protocol support")
         check_command(results, "cd-info")
-        check_command(results, "kdialog")
-        check_command(results, "zenity")
-        for module, label, required in (
-            ("psutil", "psutil (CD playback/process discovery)", True),
-            ("PyQt6", "PyQt6 (CD player UI)", False),
-            ("PyQt6.QtDBus", "QtDBus (MPRIS/media-key integration)", False),
+        for module, label in (
+            ("PyQt6", "PyQt6 (CD player window)"),
+            ("PyQt6.QtDBus", "QtDBus (KDE/MPRIS controls)"),
         ):
             available = python_module_available(module)
             add(
                 results,
-                "ok" if available else ("info" if not required else "error"),
+                "ok" if available else "error",
                 "dependencies",
                 f"{label}: {'available' if available else 'not installed'}",
             )

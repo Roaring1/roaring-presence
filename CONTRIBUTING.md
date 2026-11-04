@@ -13,8 +13,9 @@ core.
 - Use Python 3.10 or newer and Bash.
 - Keep tests offline and hardware-independent. Do not require a CD drive,
   running Discord client, game process, or desktop compositor in CI.
-- Keep optional integrations optional. A missing Qt stack or `psutil` should
-  produce a usable fallback or a clear diagnostic, not a traceback.
+- Keep optional integrations optional. The built-in CD player requires PyQt6
+  and QtDBus; the doctor should report missing packages clearly. Do not add
+  silent dialog or process-scanning fallbacks.
 - Keep installation per-user by default. Do not add implicit `sudo`, alter
   Flatpak/Snap permissions, or overwrite existing user configuration.
 - Do not put credentials, real user configuration, audio metadata caches, or
@@ -26,9 +27,6 @@ core.
 python3 -m py_compile \
   core/bin/roaring-presenced core/bin/roaring-presence-doctor \
   providers/audio-cd/bin/roaring-cd-presence \
-  providers/audio-cd/bin/roaring-cd-session \
-  providers/audio-cd/bin/roaring-cd-autoplay \
-  providers/audio-cd/bin/cd_paths.py \
   providers/audio-cd/bin/roaring-cd-player \
   providers/minecraft/bin/roaring-minecraft-presence \
   tools/assets/bin/roaring-presence-art.py \

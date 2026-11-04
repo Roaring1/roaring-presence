@@ -1,6 +1,11 @@
 # Hardware validation
 
-## Audio-CD to Discord Rich Presence — 2026-10-30
+> Historical record: the test below predates the single-owner CD-session
+> simplification. Its disc, metadata and Discord observations remain useful,
+> but its autoplay-helper and separate-player lifecycle no longer describe the
+> current implementation. Re-run the real-drive checks below before release.
+
+## Audio-CD to Discord Rich Presence — 2026-10-30 (historical)
 
 A real optical-drive integration test was completed on the desktop after the
 modular deployment.
@@ -17,7 +22,7 @@ modular deployment.
 
 1. Inserting the disc started `roaring-cd-presence@sr0.service`.
 2. The provider read the kernel table of contents and detected all 11 tracks.
-3. The autoplay/player UI opened immediately.
+3. The player UI opened immediately through the then-current launch helper.
 4. The provider connected to the local `roaring-presenced` socket.
 5. Discord displayed the CD activity with artist/album/track information and
    playback timing, alongside the existing Essential Mod / Minecraft status.
@@ -53,12 +58,11 @@ entry. Plasma's task-manager tooltip volume controls are enabled by default.
 The original mpv native PipeWire stream identified itself only as `mpv`, so
 Plasma could not associate it with the visible Audio CD task.
 
-The new autoplay command selects mpv's PulseAudio compatibility output and
-sets `--audio-client-name=Audio CD`. A silent, zero-volume test stream
+The earlier mpv launch path selected mpv's PulseAudio compatibility output and
+set `--audio-client-name=Audio CD`. A silent, zero-volume test stream
 confirmed PipeWire then publishes `application.name=Audio CD`, the fallback
 identity Plasma's task manager uses to associate an application audio stream
-with its task. The current already-running mpv process keeps its old identity
-until the player is relaunched with the new options.
+with its task. An already-running mpv process kept its old identity until it was relaunched with those options.
 
 **Relevant runtime observations**
 
@@ -82,3 +86,72 @@ remain separate tests.
 The legacy Vesktop-to-Prism IPC bridge was left enabled during validation. It
 preserves the pre-existing Minecraft/Essential Mod integration and was not
 disabled.
+
+## Single-owner lifecycle validation — 2026-11-04
+
+A real-drive test of the simplified implementation was completed on the
+maintainer's Nobara/KDE desktop.
+
+**Hardware and runtime**
+
+- Optical drive: HL-DT-ST DVDRAM GP60NB50 (`/dev/sr0`).
+- Audio CD: *Alabama & Friends*, 11 audio tracks.
+- KDE Plasma, PipeWire 1.4.11, and Vesktop Flatpak Discord IPC.
+- The owner muted audio externally for the playback test; software volume and
+  mute settings were not changed by the test.
+
+**Observed results**
+
+1. Insertion at 03:32:10 PST started exactly one
+   `roaring-cd-presence@sr0.service`. The provider found all 11 audio tracks,
+   resolved cached MusicBrainz metadata and cover art, registered the player
+   with MPRIS, and connected to the manager.
+2. Before Play, MPRIS reported `Stopped` with empty track metadata, no mpv
+   playback process existed, the CD provider was `live: false`, and the
+   manager had no activity winner. The provider logged
+   `playback inactive; clearing CD activity`.
+3. MPRIS Play started mpv with `cdda://` on the per-drive
+   `roaring-cd-mpv-sr0.sock` IPC socket. MPRIS changed to `Playing`, and
+   Discord connected through the Vesktop Flatpak IPC socket.
+4. Track 1 was identified as “Tennessee River” and published. The manager
+   reported the CD provider as the activity winner.
+5. MPRIS Pause changed playback to `Paused`; the provider became
+   `live: false`, the manager winner became `null`, and Discord received an
+   explicit cleared activity. mpv remained owned by the player for resume.
+6. MPRIS Play resumed playback and restored CD activity.
+7. MPRIS Next advanced from track 1 (“Tennessee River”) to track 2
+   (“Love In the First Degree”), and the new track was published to Discord.
+8. MPRIS Quit ended the complete session successfully. The provider logged
+   `player closed; ending the CD session`; systemd reported exit status 0;
+   the mpv process ended; the MPRIS service name disappeared; and the manager
+   published a final clear and removed the CD provider.
+9. The physical eject command used by the GUI action (`eject /dev/sr0`) was
+   run against the real drive. The drive stopped reporting inserted media and
+   the CD service remained inactive.
+10. Reinsertion at 03:37:36 PST started a fresh per-drive session. The new
+    player reported `Stopped`, `CanPlay=true`, empty metadata, no mpv
+    process, and no Discord activity winner. This confirmed a clean
+    eject/reinsert cycle without stale session state.
+
+**Second audio-CD smoke test**
+
+A second disc was inserted later in the same session. The kernel reported 17
+audio tracks. MusicBrainz resolved the album *Songs Children Love to Sing*;
+the provider published track 1, “This-A-Way That-A-Way,” then track 2,
+“Miss Mary Mack.” Release and release-group artwork lookups both returned
+HTTP 404, which was logged as an optional artwork miss rather than a playback
+failure. The player was closed normally and systemd recorded a successful
+service exit. This provides a second-disc audio/metadata smoke test; it is not
+a data-disc or ISO9660 compatibility result.
+
+**Control-surface coverage and limits**
+
+The player source confirms that the visible Next button calls
+`service.skip(1)`, and the visible Eject button calls `service.eject()`.
+The equivalent MPRIS Next operation and the underlying eject executable/device
+operation were exercised successfully. The physical GUI button clicks
+themselves were not automated, and the KDE taskbar's visual controls were not
+separately clicked during this run.
+
+The live hardware sequence is separate from CI results. No release tag was
+created as part of this validation.

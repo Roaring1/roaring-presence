@@ -3,28 +3,29 @@
 ## Responsibility boundaries
 
 ```text
-                   optical media event             launcher event
-                          |                              |
-                          v                              v
-                   audio-CD session                Minecraft provider
-                   /              \
-          player-only mode      Discord mode                 |
-             |                  |                            |
-        kernel TOC          kernel TOC                 PID discovery once
-        + playback          + playback                       |
-        + MPRIS             + MPRIS                    pidfd + inotify
-             |                  |
-             |             local provider socket
-             |                  |
-             |                  v
-             |          core / roaring-presenced
-             |                  |
-             |           one Discord IPC link
-             |                  |
-             v                  v
-        Desktop audio       Discord client
+                  optical media event          launcher event
+                         |                         |
+                         v                         v
+              per-disc audio-CD session      Minecraft provider
+                         |                         |
+                         v                    PID discovery once
+               owned CD player process              |
+               /       |       \\            pidfd + inotify
+            window    mpv     MPRIS
+                         |       |
+                    desktop audio  KDE media controls
+                         |
+              optional provider socket
+                         |
+                         v
+                core / roaring-presenced
+                         |
+                  one Discord IPC link
+                         |
+                         v
+                  Discord client
 
-        tools/assets: independent local image preparation commands
+         tools/assets: independent local image preparation
 ```
 
 ## Processing model
@@ -33,23 +34,29 @@
 
 The core is an arbitrator, not a source collector. It accepts local provider
 messages, chooses the highest-priority live activity, and is the only component
-that talks to Discord. The systemd socket is passive activation plumbing. The
-manager is short-lived when no provider is connected.
+that talks to Discord. Its systemd socket is passive activation plumbing; the
+manager exits when the final provider disconnects.
 
 ### Audio-CD
 
-An insertion event starts one per-drive process. It performs immediate local
-disc reads, then one bounded online metadata task (optional). It follows
-playback and drive state for the lifetime of the inserted disc and checks for
-ejects during that session. There are two modes over the same engine:
+An insertion event starts one per-drive user service. The session reads the
+kernel TOC and CD-Text, resolves optional online metadata, and starts one
+owned player process. The player owns the window, its mpv child, the MPRIS2
+registration, and drive-eject detection. Each optical drive gets a private mpv
+IPC socket; the MPRIS service remains a single desktop player. There are no
+detached playback watchdogs, transient systemd scopes, paused preloads, or
+process-table scans for unrelated desktop players.
 
-- **Player-only:** starts playback, publishes MPRIS/media-key controls, and
-  monitors eject. It has no connection or dependency on the Discord core.
-- **Discord-enabled:** does the same work, plus sends activity messages over
-  the provider socket to the shared core. The core remains the only Discord
-  IPC client.
+The player-only mode does not connect to the Discord core. The Discord-enabled
+mode sends provider messages to the shared core. In that mode, the provider
+requires an affirmative mpv state (`path` present and `pause` false) before it
+publishes a song. Pause, stop, unknown state, player exit, and eject clear the
+activity. Resume republishes it.
 
-Neither mode leaves a global drive-polling watcher running.
+Closing the player stops and reaps mpv, releases MPRIS, and ends the per-disc
+service. Eject follows the same cleanup path. KDE's taskbar and media controls
+use the in-process MPRIS interface; the application installs no global
+keyboard listener or separate media-key service.
 
 ### Minecraft
 
@@ -71,8 +78,8 @@ Portal.
 
 The providers share one local wire protocol, config location, and Discord
 publisher. Keeping them together avoids multiple competing Discord IPC
-clients, while the component directories and installer profiles make each
-project independently understandable and installable.
+clients, while component directories and installer profiles keep each feature
+independently understandable and installable.
 
 The root-level old paths are symlinks for compatibility. Canonical source and
 packaging live beside each component. Deprecated direct-RPC bridge files are
@@ -81,7 +88,7 @@ kept in `legacy/` but are not part of the default install.
 ## Extension checklist
 
 A provider should own its source-specific lifecycle, avoid broad polling after
-source detection, publish on meaningful changes, clear on shutdown, close its
-socket, and keep third-party network work outside the core. Add an isolated
-test for its activity builder and lifecycle. Do not make another Discord IPC
-connection.
+source detection, publish only meaningful live state, clear on shutdown, close
+its socket, and keep third-party network work outside the core. Add isolated
+tests for its activity builder and lifecycle. Do not add another Discord IPC
+connection or a generic resident watcher.

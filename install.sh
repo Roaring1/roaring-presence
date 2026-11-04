@@ -115,11 +115,31 @@ if [[ -n "${SELECTED[core]:-}" ]]; then
 fi
 
 if [[ "$HAS_CD" -eq 1 ]]; then
+  # Remove only the exact helper scripts installed by older project releases.
+  # Never delete an unrelated user command with the same filename.
+  for obsolete in roaring-cd-autoplay roaring-cd-session cd_paths.py; do
+    case "$obsolete" in
+      roaring-cd-autoplay) marker='roaring-cd-autoplay -- extremely minimal' ;;
+      roaring-cd-session) marker='Standalone audio-CD session entry point' ;;
+      cd_paths.py) marker='Small shared path helpers for the standalone audio-CD tools.' ;;
+    esac
+    old_binary="$BIN_DIR/$obsolete"
+    if [[ -L "$old_binary" ]]; then
+      target=$(readlink "$old_binary")
+      if [[ "$target" == "$HERE/bin/$obsolete" || "$target" == "$HERE/providers/audio-cd/bin/$obsolete" ]]; then
+        rm -f "$old_binary"
+      fi
+    elif [[ -f "$old_binary" ]] && grep -Fq "$marker" "$old_binary"; then
+      rm -f "$old_binary"
+    fi
+    legacy_link="$HOME/bin/$obsolete"
+    if [[ -L "$legacy_link" && "$(readlink "$legacy_link")" == "$BIN_DIR/$obsolete" ]]; then
+      rm -f "$legacy_link"
+    fi
+  done
+
   install_bin roaring-presence-doctor "$HERE/core/bin/roaring-presence-doctor"
   install_bin roaring-cd-presence "$HERE/providers/audio-cd/bin/roaring-cd-presence"
-  install_bin roaring-cd-session "$HERE/providers/audio-cd/bin/roaring-cd-session"
-  install -m 644 "$HERE/providers/audio-cd/bin/cd_paths.py" "$BIN_DIR/cd_paths.py"
-  install_bin roaring-cd-autoplay "$HERE/providers/audio-cd/bin/roaring-cd-autoplay"
   install_bin roaring-cd-player "$HERE/providers/audio-cd/bin/roaring-cd-player"
   install_bin roaring-presence-scan "$HERE/providers/audio-cd/bin/roaring-presence-scan"
   install -d "$CONFIG_ROOT/systemd/user" "$DATA_ROOT/applications"
@@ -135,14 +155,17 @@ if [[ "$HAS_CD" -eq 1 ]]; then
   # Desktop Exec entries are generated with the absolute installed path; they
   # must not rely on a desktop shell inheriting ~/.local/bin in PATH.
   python3 - "$HERE/providers/audio-cd/desktop/roaring-cd-player.desktop" \
-      "$DATA_ROOT/applications/roaring-cd-player.desktop" "$BIN_DIR" <<'PYDESKTOP'
+      "$DATA_ROOT/applications/roaring-cd-player.desktop" "$BIN_DIR" "$PLAYER_ONLY_CD" <<'PYDESKTOP'
 from pathlib import Path
 import sys
-source, destination, bindir = map(Path, sys.argv[1:])
+source, destination, bindir = map(Path, sys.argv[1:4])
+player_only = sys.argv[4] == "1"
 text = source.read_text(encoding="utf-8")
-executable = str(bindir / "roaring-cd-player")
+executable = str(bindir / "roaring-presence-scan")
 if any(char.isspace() for char in executable):
     executable = '"' + executable.replace("\\", "\\\\").replace('"', '\\"') + '"'
+if player_only:
+    executable += " --player-only"
 text = text.replace("@ROARING_PRESENCE_EXEC@", executable)
 if "@ROARING_PRESENCE_EXEC@" in text:
     raise SystemExit("unexpanded desktop Exec placeholder")
@@ -169,6 +192,62 @@ if [[ -n "${SELECTED[core]:-}" || -n "${SELECTED[audio-cd]:-}" || -n "${SELECTED
     install -m 644 "$HERE/config/config.sample.json" "$CONFIG_DIR/config.json"
     echo "installed default config; set client_id to your Discord Application ID"
   fi
+fi
+
+if [[ "$HAS_CD" -eq 1 && -f "$CONFIG_DIR/config.json" ]]; then
+  # Migrate only CD settings made obsolete by the single-owner session. Keep
+  # the user's Discord ID, metadata choices, link templates, and all other
+  # component settings untouched.
+  python3 - "$CONFIG_DIR/config.json" <<'PYCONFIG'
+import json
+import os
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, ValueError) as exc:
+    print(f"warning: could not migrate CD settings in {path}: {exc}", file=sys.stderr)
+    raise SystemExit(0)
+cd = data.get("cd")
+if not isinstance(cd, dict):
+    raise SystemExit(0)
+changed = False
+for key in (
+    "autoplay_prompt",
+    "preload",
+    "preload_idle_seconds",
+    "idle_poll_seconds",
+    "player_ui",
+    "player_poll_seconds",
+    "player_idle_poll_seconds",
+):
+    if key in cd:
+        del cd[key]
+        changed = True
+if cd.get("mpv_ipc_socket") == "$XDG_RUNTIME_DIR/mpv-ipc.sock":
+    cd["mpv_ipc_socket"] = "$XDG_RUNTIME_DIR/roaring-cd-mpv.sock"
+    changed = True
+if changed:
+    mode = stat.S_IMODE(path.stat().st_mode)
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+            handle.write("\n")
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    print("migrated obsolete CD player settings; preserved the rest of your config")
+PYCONFIG
 fi
 
 # Persist the exact source checkout and component selection so a future update
@@ -270,10 +349,7 @@ else
   python3 -m py_compile \\
     core/bin/roaring-presenced core/bin/roaring-presence-doctor \\
     providers/audio-cd/bin/roaring-cd-presence \\
-    providers/audio-cd/bin/roaring-cd-session \
-    providers/audio-cd/bin/roaring-cd-autoplay \\
     providers/audio-cd/bin/roaring-cd-player \\
-    providers/audio-cd/bin/cd_paths.py \
     providers/minecraft/bin/roaring-minecraft-presence \\
     tools/assets/bin/roaring-presence-art.py \\
     tools/assets/bin/roaring-presence-assets tests/test_regressions.py
@@ -289,10 +365,7 @@ cd "\$SOURCE_DIR"
 python3 -m py_compile \\
   core/bin/roaring-presenced core/bin/roaring-presence-doctor \\
   providers/audio-cd/bin/roaring-cd-presence \\
-  providers/audio-cd/bin/roaring-cd-session \
-  providers/audio-cd/bin/roaring-cd-autoplay \\
   providers/audio-cd/bin/roaring-cd-player \\
-  providers/audio-cd/bin/cd_paths.py \
   providers/minecraft/bin/roaring-minecraft-presence \\
   tools/assets/bin/roaring-presence-art.py \\
   tools/assets/bin/roaring-presence-assets tests/test_regressions.py
@@ -398,7 +471,7 @@ if [[ "$HAS_CD" -eq 1 ]]; then
   echo
   if [[ "$PLAYER_ONLY_CD" -eq 1 ]]; then
     echo "Check dependencies: $BIN_DIR/roaring-presence-doctor --component cd-player"
-    echo "Start manually (replace sr0 with your drive): $BIN_DIR/roaring-cd-session /dev/sr0"
+    echo "Start manually (replace sr0 with your drive): $BIN_DIR/roaring-cd-presence --player-only /dev/sr0"
   else
     echo "Check dependencies and Discord IPC: $BIN_DIR/roaring-presence-doctor --component audio-cd"
     echo "Set your Discord Application ID in: $CONFIG_DIR/config.json"
