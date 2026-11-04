@@ -1,0 +1,7 @@
+# Optional: start the standalone audio-CD player when a disc is inserted.
+# Install once from the repository root:
+#   sudo install -m 644 providers/audio-cd/udev/99-roaring-cd-player.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload
+# This rule does not require a Discord client, Application ID, or presence core.
+
+ACTION=="change", KERNEL=="sr[0-9]*", ENV{ID_CDROM_MEDIA_TRACK_COUNT_AUDIO}=="?*", ENV{SYSTEMD_USER_WANTS}+="roaring-cd-player@%k.service"

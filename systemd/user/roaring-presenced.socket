@@ -1,10 +1,1 @@
-[Unit]
-Description=roaring-presence manager socket
-
-[Socket]
-ListenStream=%t/roaring-presence.sock
-SocketMode=0600
-RemoveOnStop=true
-
-[Install]
-WantedBy=sockets.target
+../../core/systemd/user/roaring-presenced.socket

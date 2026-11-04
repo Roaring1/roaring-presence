@@ -1,268 +1,444 @@
 # roaring-presence
 
-Discord Rich Presence for actual audio CDs, on Linux.
+**A modular Linux audio-CD player with optional Discord Rich Presence.**
+Install just the CD player, or add the Discord publisher, Minecraft activity,
+and generic artwork tools when you need them. The standalone player does not
+require Discord, a Discord Application ID, or the shared presence daemon.
 
-Put a disc in the drive and Discord shows what's spinning: artist, track,
-album, cover art, real progress bar. A window pops up with the track list so
-you can actually run the thing. Take the disc out and it all goes away.
+This repository is a set of installable components, not one opaque desktop
+daemon:
 
-Nothing phones home and nothing asks Spotify what you're listening to. The
-disc is the source of truth. The TOC and CD-Text come straight off the drive
-via ioctl, and the position comes from mpv over its IPC socket. There's no
-background daemon sitting around either -- udev starts it on insert, it exits
-when the disc is gone.
+## Quick start
 
+On Fedora/Nobara, install the base audio-CD dependencies first. Add
+`python3-pyqt6` for the full graphical player window and MPRIS controls:
+
+```bash
+sudo dnf install mpv python3-psutil python3-pyqt6
+
+git clone https://github.com/Roaring1/roaring-presence.git
+cd roaring-presence
+./install.sh --component cd-player
 ```
-Listening to Slipknot
-Adderall
-The End, So Far · Track 1 of 12
-[cover art]  0:55 ──────────  5:41
+
+With a disc inserted, start it manually (replace `sr0` with your drive):
+
+```bash
+~/.local/bin/roaring-cd-session /dev/sr0
 ```
 
-## Pieces
+For automatic start on disc insertion, install the optional udev rule printed
+by the installer; it requires one explicit, system-wide administrator action.
+Other distributions and package names are covered in
+[Linux installation](docs/linux-installation.md).
 
-| Path | What it does |
-| --- | --- |
-| `bin/roaring-presenced` | The manager. Owns the single Discord IPC connection and publishes whichever provider has the highest priority. Socket-activated. |
-| `bin/roaring-cd-presence` | The audio-CD provider. Reads the disc, resolves metadata, watches playback, publishes activity. One instance per drive. |
-| `bin/roaring-cd-autoplay` | Minimal "disc inserted — what now?" prompt: full album, a single track, or nothing. |
-| `bin/roaring-presence-scan` | Picks up drives that already had a disc at login. |
-| `bin/roaring-minecraft-presence`, `bin/roaring_vesktop_minecraft_*` | Unrelated Minecraft provider, kept here so the whole stack is versioned together. |
-| `systemd/user/` | User units. `roaring-presenced.socket` activates the manager on demand. |
-| `udev/` | Rule that starts the provider when a disc with audio tracks is inserted. |
+To add Discord Rich Presence later, install the `audio-cd` profile and set the
+Discord Application ID in your user config. The existing CD player remains the
+same feature; Discord publishing is just an additional component.
 
-## Install
+
+| Component | Job | When it runs |
+| --- | --- | --- |
+| **CD player** | Disc detection, metadata, playback controls, MPRIS/media keys and eject cleanup | Started by an optical-disc event or explicit command; lives for that disc session |
+| **Discord CD** | Publishes the same CD session as Discord Rich Presence through the shared core | Optional companion to the CD player; no duplicate player process |
+| **Core** | One Discord IPC connection and provider-priority arbitration | Socket-activated; exits shortly after its last provider leaves |
+| **Minecraft** | Detect a game session and publish instance/server/world details | Optional launcher-triggered provider; watches that one process |
+| **Assets** | Prepare arbitrary images and generate optional built-in artwork | One-shot local commands; no service |
+
+The core can be in the background while it is doing useful work. The distinction
+is that it has a defined job and lifecycle: the socket is passive, providers
+connect when their source event occurs, and the manager releases its Discord
+connection and exits when no providers remain. There is no generic scan-everything
+watchdog installed by default.
+
+## Pick the parts you want
+
+The default install is the standalone audio-CD player:
 
 ```bash
 ./install.sh
-# optional, needs root: start automatically on disc insert
-sudo install -m 644 udev/99-roaring-presence-cd.rules /etc/udev/rules.d/
-sudo udevadm control --reload
 ```
+
+It does not install or contact Discord. To add Discord Rich Presence for the
+same CD playback session, choose:
+
+```bash
+./install.sh --component audio-cd
+# equivalent, more explicit name:
+./install.sh --component discord-cd
+```
+
+Other parts stay opt-in:
+
+```bash
+./install.sh --component core
+./install.sh --component minecraft
+./install.sh --component assets
+./install.sh --component all
+```
+
+The Discord CD and Minecraft providers include the small core automatically.
+Components can be combined by repeating `--component`. See
+`./install.sh --help` for all options. The installer uses `~/.local/bin`,
+preserves existing configuration, and does not use sudo. A separate udev
+rule is optional for automatic disc insertion.
+
+For supported package names and setup details, see
+[Linux installation](docs/linux-installation.md).
+
+For Discord-enabled profiles, the installer:
+- installs only explicit executable entry points (never a broad `bin/*` glob);
+- preserves an existing user config rather than overwriting it;
+- enables only the core's passive systemd user socket;
+- does not enable the Minecraft provider or a periodic process watcher;
+- does not install the obsolete standalone Discord RPC bridge.
+
+Only Discord-enabled components need a Discord Application ID. Open
+[Discord Developer Portal](https://discord.com/developers/applications), create
+or choose an application, and copy its **Application ID** into
+`~/.config/roaring-presence/config.json` as `client_id`. It is a public
+application identifier, not a bot token or password.
+
+Then run the read-only setup check:
+
+```bash
+~/.local/bin/roaring-presence-doctor
+~/.local/bin/roaring-presence-doctor --json
+```
+
+It checks JSON configuration, the application ID, Discord IPC discovery,
+optional dependencies, asset keys, and the manager socket path. By default it
+does not connect to that socket, so it cannot trigger systemd activation. Use
+`roaring-presence-doctor --query-manager` only when you explicitly want a live
+status request; connecting may activate the manager socket.
+
+## Discord client compatibility
+
+This project is a local Discord RPC client. It sends activity to a running
+Discord-compatible desktop client over a Unix socket; it does not inspect how
+the client is packaged and does not require Vencord. Native installs normally
+use the standard socket in `$XDG_RUNTIME_DIR` (or the configured temp directory).
+The core also checks common Flatpak and Snap socket layouts. User-configured
+paths are tried first, and the built-in fallback list is still searched.
+
+The Discord client must be running and expose its local RPC endpoint. Some
+alternative clients require their RPC/arRPC integration to be enabled in the
+client's own settings. A browser-only Discord tab is not a local desktop IPC
+server. See [the client compatibility guide](docs/discord-client-compatibility.md)
+for exact support boundaries and diagnostics.
+
+## Components
+
+### Core publisher
+
+`core/` owns the one Discord Rich Presence IPC connection. Providers send
+newline-delimited JSON over the private Unix socket
+`$XDG_RUNTIME_DIR/roaring-presence.sock`; providers never connect to Discord
+directly.
+
+The manager arbitrates live activities by priority. The bundled defaults put
+audio CD above Minecraft, so a disc session wins while it is present and the
+Minecraft activity becomes visible again when the disc provider disconnects.
+The socket has mode `0600`; it is local to the user.
+
+The manager speaks Discord's standard local RPC-over-IPC protocol. It does not
+use Vencord APIs, a browser extension, or a game-scanning plugin. Any compatible
+Linux desktop client that exposes the local IPC socket can receive provider
+activities. See [Discord client compatibility](docs/discord-client-compatibility.md)
+for native, Flatpak, Vesktop, Snap, and troubleshooting notes.
+
+The systemd socket can remain enabled. That is not the same as keeping a
+polling daemon resident: systemd holds the listening socket and starts the
+manager when a provider connects. The manager exits after the final provider
+disconnects (one second by default), clearing activity and closing its Discord
+connection first.
+
+See [core documentation](core/README.md) and
+[the provider protocol](docs/architecture.md).
+
+### Audio-CD provider
+
+`providers/audio-cd/` owns the shared audio-CD session engine. The
+`cd-player` install profile uses it without Discord; `audio-cd` adds the
+optional Rich Presence publisher. It handles audio CDs from insertion to eject:
+
+- reads the table of contents and CD-Text from the Linux kernel first, with
+  `cd-info` as a fallback;
+- computes the MusicBrainz Disc ID and can fill missing artist, album, and
+  track titles from MusicBrainz;
+- fetches front artwork from the Cover Art Archive when enabled;
+- caches resolved metadata and artwork locally per disc;
+- follows playback, publishes the active track and progress, and clears
+  activity/stops playback on eject;
+- provides the optional PyQt6 player window, MPRIS2 controls, media keys,
+  autoplay choice, and paused preload.
+
+MusicBrainz metadata lookup and Cover Art Archive art lookup are separate
+settings. Turning off `use_cover_art_archive` does not turn off MusicBrainz
+track-title lookup.
+
+The provider is session work, not a system-wide watcher. A udev rule can start
+it on an audio-disc insertion event; KDE actions or a direct command can do
+the same. A one-shot catch-up scan is optional:
+
+```bash
+./install.sh --component cd-player --enable-login-scan
+./install.sh --component audio-cd --enable-login-scan
+```
+
+Automatic udev activation needs one root-owned rule installation, printed by
+the installer. Without it, start the provider from your desktop's device
+action or run:
+
+```bash
+~/.local/bin/roaring-cd-session /dev/sr1   # no Discord dependency
+~/.local/bin/roaring-cd-presence /dev/sr1  # publishes to Discord
+```
+
+See [audio-CD documentation](providers/audio-cd/README.md).
+
+### Minecraft provider
+
+`providers/minecraft/` publishes a session for Minecraft Java or Bedrock.
+It can report the edition, version, mod loader, launcher instance, multiplayer
+server, or single-player world name when those details are available.
+
+Start it from a launcher event (or manually):
+
+```bash
+systemctl --user start --no-block roaring-minecraft-presence.service
+```
+
+The bundled user unit has a short 30-second launch-detection window for
+pre-launch hooks. Once it identifies the game, it attaches to that process:
+on modern Linux it waits on a **pidfd** for process exit and uses **inotify**
+for instance-log changes. It does not rescan the entire process table every
+few seconds for the whole game session. If pidfd is unavailable, it falls
+back to checking only that process's start identity at a configurable
+interval.
+
+For a launcher that can provide the actual Java PID, use
+`roaring-minecraft-presence --pid PID` to avoid broad discovery entirely.
+For a one-shot payload test:
+
+```bash
+~/.local/bin/roaring-minecraft-presence --demo --once --dry-run
+```
+
+See [Minecraft documentation](providers/minecraft/README.md).
+
+### Asset tools
+
+`tools/assets/` contains two local, one-shot tools:
+
+- `roaring-presence-assets` converts any supported source image into a
+  square PNG and emits a manifest. Give images friendly keys or let their
+  filenames supply the keys.
+- `roaring-presence-art.py` generates the optional roaring-presence-themed
+  app icon and sample activity art. It can change output directory, size, and
+  key prefix, and writes a manifest with the upload names and config mapping.
+
+Example for arbitrary artwork:
+
+```bash
+roaring-presence-assets --output-dir ./my-assets --fit contain \
+  "studio-logo=~/Pictures/logo.webp" \
+  "game-cover=~/Pictures/cover.jpg" \
+  ~/Pictures/brand-mark.png
+```
+
+This produces `studio-logo.png`, `game-cover.png`,
+`brand-mark.png`, and `manifest.json`. To crop instead of letterbox:
+
+```bash
+roaring-presence-assets --fit cover --overwrite \
+  "wide-banner=~/Pictures/banner.png"
+```
+
+The built-in artwork generator is independently configurable:
+
+```bash
+roaring-presence-art.py --output-dir ~/Pictures/my-discord-assets \
+  --size 1024 --key-prefix my-app
+```
+
+**Upload is intentionally generic, not account-bound.** The tools prepare PNGs
+and tell you the matching asset keys; they do not store Discord credentials or
+pretend to upload through an undocumented API. Open your application's
+**Rich Presence → Art Assets** page in the Developer Portal, upload the PNGs,
+and use the exact keys from `manifest.json`. Use the generated `config.assets`
+mapping in `config.json` if you changed the keys.
+
+The asset packer requires Pillow. See [asset-tool documentation](tools/assets/README.md).
 
 ## Configuration
 
-`~/.config/roaring-presence/config.json` (see `config/config.sample.json`).
-Keys under `cd`:
+Discord-enabled profiles copy `config/config.sample.json` to
+`~/.config/roaring-presence/config.json` only if that file does not exist.
+The standalone CD player needs no config. Edit your user file; reinstalling
+will never overwrite it.
 
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `device` | `"auto"` | Drive to watch, or auto-detect the one holding an audio disc. USB drives re-enumerate (`/dev/sr1` → `/dev/sr2`), so `auto` is recommended. |
-| `poll_seconds` | `3` | Playback poll interval while something is playing. |
-| `idle_poll_seconds` | `6` | Slower poll when nothing is playing. |
-| `kernel_toc_first` | `true` | Read the TOC via ioctl instead of waiting on `cd-info`. |
-| `kernel_cdtext` | `true` | Read CD-Text via `SG_IO` / `READ TOC` format 5 instead of shelling out to `cd-info`. Set `false` to force the `cd-info` path. |
-| `cdtext_probe_timeout` | `12` | Cap on the `cd-info` CD-Text probe. Only used when `kernel_cdtext` is off or came back empty. |
-| `cd_info_timeout` | `45` | Same: `cd-info` fallback only. |
-| `cd_info_attempts` | `2` | Same: `cd-info` fallback only. |
-| `metadata_grace_seconds` | `2.0` | How long the first publish waits for online metadata before going out without it. |
-| `use_cover_art_archive` | `true` | Fetch cover art from the Cover Art Archive. |
-| `show_progress_bar` | `true` | Publish `timestamps` so Discord draws the bar. |
-| `progress_drift_seconds` | `2.5` | Only re-publish the bar when it actually drifted (seek, pause, stall). |
-| `autoplay_prompt` | `true` | Offer to start playback on insert. Set `false` to disable. |
-| `preload` | `true` | Open the disc paused right after insert so the first play is instant. See [Preload](#preload). |
-| `preload_idle_seconds` | `60` | If you never touch the window, the preload is dropped after this long and the drive spins down. |
-| `mpv_ipc_socket` | `$XDG_RUNTIME_DIR/mpv-ipc.sock` | Where mpv exposes position. |
-| `links` | see below | Templates for the clickable song/album links. |
+The important top-level settings are:
 
-### Clickable links
-
-Discord renders `details_url` on the song line and `state_url` on the album
-line. Templates support `%(query)s`, `%(album_query)s` (URL-encoded
-artist + title / artist + album), `%(release_id)s`, and `%(discid)s`:
-
-```json
-"links": {
-  "track": "https://music.youtube.com/search?q=%(query)s",
-  "album": "https://musicbrainz.org/release/%(release_id)s",
-  "album_fallback": "https://music.youtube.com/search?q=%(album_query)s"
-}
-```
-
-Swap in Spotify (`https://open.spotify.com/search/%(query)s`), Songwhip, or
-anything else. `album_fallback` is used when MusicBrainz has no release for
-the disc.
-
-## Controls
-
-Inserting a disc opens `roaring-cd-player`: a small window with the cover, the
-track list, and prev / play-pause / next.  It is both the insert prompt and the
-transport -- pick “Entire album” or any track, and the same window keeps
-controlling playback instead of disappearing.
-
-It also publishes **MPRIS2** as `org.mpris.MediaPlayer2.roaringcd`, which is
-what makes the **keyboard media keys** work, along with the KDE panel widget,
-the lock screen, and `playerctl`.  mpv has no MPRIS of its own unless the
-mpv-mpris plugin is installed, so the player provides it and proxies every
-call to mpv over the IPC socket.
-
-### Track names
-
-Plenty of discs ship CD-Text that just says `Track 1`, `Track 2`, ... which is
-useless. When the disc names look like placeholders and MusicBrainz has real
-ones, the real names win. If both sides have something real and they disagree,
-you get the disc's name with the other one after it in grey parentheses:
-
-```
- 3.  Intro (Entrance Hall)
-```
-
-The grey half is capped at half the row and elided, so a long alternate name
-can't push the actual title off the edge. Hover for the full thing.
-
-### Buttons and keys
-
-Double-click a track (or select it and press Enter) to play it; `Space`,
-`Left` and `Right` work as play/pause and skip.  Every press is acknowledged
-immediately: the button sinks for a moment to show the click was consumed,
-stays dimmed while the command is still unconfirmed, and shows a count when
-several presses are outstanding.  Rapid skips are coalesced into a single
-seek, so spamming skip lands on the track you would expect rather than
-queueing up a backlog.  While a cold drive is spinning up, the play button
-becomes a spinner and the progress bar goes indeterminate.
-
-All mpv IPC and every drive ioctl run on a worker thread, and mpv state
-arrives through `observe_property` rather than polling, so the window never
-blocks on the drive or the socket.
-
-Closing the window does not quit while a disc is playing: the MPRIS service
-stays up so the media keys keep working.  Reopen it from the panel, from the
-“Audio CD” launcher entry, or with `roaring-cd-player --device /dev/sr1`.
-The process exits on eject.
-
-Track skipping is chapter navigation, because `cdda://` is one stream whose
-chapters are the tracks.  Previous behaves like a CD deck: it restarts the
-current track unless you are within the first 3 seconds.
-
-Media keys go to whichever player the desktop considers active, so if another
-app grabs them, raise this window (or pause the other player) to hand them
-back.
-
-| Key | Meaning |
+| Setting | Purpose |
 | --- | --- |
-| `player_ui` | Open the control window on insert. `false` falls back to the old kdialog menu. |
-| `player_poll_seconds` | Poll interval while playing. |
-| `player_idle_poll_seconds` | Poll interval while stopped. |
+| `client_id` | Your Discord application's public Application ID |
+| `ipc_socket_candidates` | Preferred local Discord IPC socket paths; portable built-in fallbacks are always tried |
+| `idle_exit_seconds` | Grace period before the empty manager exits |
+| `priorities` | Relative priority of each provider |
+| `assets` | Discord Rich Presence asset keys |
+| `cd` | Audio-CD discovery, metadata, player and playback settings |
+| `minecraft` | Minecraft process/session details and fallback interval |
 
-## Preload
+See the sample config for all CD and Minecraft options. Environment variables
+such as `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_RUNTIME_DIR` and
+`HOME` are respected where applicable.
 
-The annoying bit about the old flow: insert a disc, wait for it to be read,
-the drive spins down while you decide, then you hit play and wait for it to
-spin up *again*. Two waits for one album.
+## Requirements
 
-So the drive is already awake when the window opens, and the window quietly
-opens the disc paused at track 1 (`roaring-cd-autoplay --preload`, which is
-mpv with `--pause=yes --idle=yes --cache=yes`). Hitting play just unpauses --
-no second spin-up.
+The project targets Linux desktops with user systemd and Unix sockets.
 
-It isn't a guess about what you want, and it doesn't count as playback:
+| Feature | Required | Optional / fallback |
+| --- | --- | --- |
+| Core | Python 3.10+; a compatible Discord desktop client exposing local RPC/IPC; Linux user systemd | Known native, Flatpak, and Snap socket paths are auto-discovered; custom paths can be added |
+| Audio-CD detection | Linux optical drive and kernel CD-ROM ioctls | `cd-info` fallback |
+| CD playback | `mpv` with CDDA support | Other desktop CD players can be used outside the built-in UI |
+| CD session tracking | `psutil` for active-player discovery, track and progress tracking | Required for reliable session state and autoplay avoidance |
+| CD player window | PyQt6, QtDBus and a graphical session | kdialog/zenity prompt and command-line playback |
+| CD metadata | Network access for MusicBrainz/CAA | Cached metadata and local CD-Text work offline |
+| Automatic disc insert | udev rule installed once as root | KDE device action or manual command |
+| Minecraft session | Java/Bedrock client | psutil is optional; Linux `/proc` fallback is built in |
+| Asset tools | Python and Pillow | None |
 
-- no spinner and no indeterminate bar, since you didn't ask for anything yet
-- Discord isn't told anything; a paused preload isn't "listening to"
-- touch any control -- play, pause, skip, a track, "Entire album" -- and the
-  warm mpv just becomes your session
-- touch nothing for `preload_idle_seconds` (60 by default) and it quits mpv
-  again, so the drive spins down like before
+No telemetry is sent. Audio-CD metadata lookup contacts MusicBrainz and, when
+enabled, the Cover Art Archive. Presence is sent to the local Discord/Vesktop
+IPC endpoint; the application does not need a Discord bot token.
 
-Set `"preload": false` under `cd` if you'd rather the drive stay quiet.
+## Repository map
 
-## Playing a disc
-
-The window is the easy path; these are for scripts and keybindings:
-
-```bash
-roaring-cd-autoplay --device /dev/sr1 --album      # whole disc
-roaring-cd-autoplay --device /dev/sr1 --track 4    # one track
-roaring-cd-autoplay --device /dev/sr1 --preload    # open it paused, don't play
-roaring-cd-player   --device /dev/sr1              # (re)open the controls
-roaring-cd-player   --device /dev/sr1 --no-window  # media keys only, no UI
+```text
+core/
+  bin/                  manager and doctor
+  systemd/user/         passive socket activation
+providers/
+  audio-cd/
+    bin/                CD provider, player, autoplay, catch-up scan
+    systemd/user/       disc-session units
+    udev/               optional insert-event rule
+    desktop/            CD player desktop entry
+  minecraft/
+    bin/                Minecraft session provider
+    systemd/user/       launcher-triggered unit
+tools/
+  assets/bin/           generic image packer and built-in artwork generator
+config/                 shared example configuration
+legacy/                 superseded direct-RPC bridge, retained for migration
+docs/                   architecture, client compatibility, and hardware notes
+tests/                  offline regression tests
 ```
 
-Playback is `mpv --cdda-device=DEV cdda://`, i.e. the raw disc. Tracks are
-chapters of that stream, selected with `--start=#N` — mpv has no `cdda://N`
-track syntax, and `--cdrom-device` was renamed to `--cdda-device` in mpv 0.40.
+The former top-level `bin/`, `systemd/user/`, `udev/`, and `desktop/`
+paths remain as compatibility symlinks for existing scripts and bookmarks.
+New development should use the component directories.
 
-Reading `cdda://` directly is deliberate: opening the disc through KIO/kio-fuse
-makes a worker transcode WAV while the provider reads the TOC, which fights
-over the drive and makes the reported position drift. mpv also gets its own
-transient systemd scope, so restarting the presence service never kills music.
+## Development checks
 
-## Metadata
-
-### Reading the disc
-
-The TOC and CD-Text both come straight from the kernel: an `SG_IO` passthrough
-of `READ TOC/PMA/ATIP` (opcode `0x43`), format 5 for CD-Text. This reads album,
-artist, and per-track titles in well under a second.
-
-`cd-info` is now only a fallback for when `kernel_cdtext` is disabled or the
-drive returns no CD-Text block. That matters because some drives never answer
-`cd-info` at all -- it would sit there until `cd_info_timeout` expired and hand
-back nothing, leaving album and artist as `?`. On those drives the kernel reader
-is the difference between full metadata and none.
-
-### Looking it up
-
-1. Disc ID (MusicBrainz) — exact match when the disc is known.
-2. If the disc ID is unknown, a CD-Text search of MusicBrainz releases, ranked
-   by how closely the track count matches the disc.
-3. Cover art from the Cover Art Archive: release first, then release-group.
-4. Results cached in `~/.cache/roaring-presence/disc-<discid>.v2.json`.
-
-All of it runs on a background thread, so presence appears from the kernel TOC
-immediately and upgrades itself (titles, cover art) when the lookup lands. If a
-lookup times out mid-way, whatever was already resolved is kept instead of
-throwing the whole thing away.
-
-MusicBrainz requests are serialised at most one per 1.1s (their published rate
-limit) and retried up to three times on 5xx, 429, and transport errors with
-geometric backoff. A `404` is a real answer -- an unknown disc ID -- and is never
-retried. Without the throttle a burst of disc-id, search, detail, and cover-art
-calls reliably drew back a wall of `503`s.
-
-If the lookup still comes back empty, it is retried in the background 20s, 45s,
-and 120s later, re-probing CD-Text as well whenever the drive is idle.
-
-Titles come from CD-Text, then MusicBrainz, then the filename, then
-`Track N`, so a disc with nothing at all still shows something. The one
-exception is placeholder CD-Text: if the disc says `Track 4` and MusicBrainz
-has a real name, the real name wins (see [Track names](#track-names)).
-
-## Eject
-
-Eject, open the tray, or yank the drive: the status clears in about a second
-and whatever playback it started is stopped. The autoplay helper watches for
-this itself, so music stops even if the provider isn't running. `SIGTERM`
-(`systemctl --user stop`, logging out) clears it too, so you don't get left
-with a stale "listening to".
-
-## Troubleshooting
+Run the offline regression suite from the repository root:
 
 ```bash
-journalctl --user -u 'roaring-cd-presence@*' -f      # provider
-journalctl --user -u roaring-presenced -f            # manager + published payloads
-tail -f ~/.cache/roaring-presence/autoplay.log       # what mpv said
-roaring-cd-presence /dev/sr1 --once --dry-run -v     # print a payload, touch nothing
+python3 -m unittest discover -s tests -v
+python3 -m py_compile \
+  core/bin/roaring-presenced \
+  core/bin/roaring-presence-doctor \
+  providers/audio-cd/bin/roaring-cd-presence \
+  providers/audio-cd/bin/roaring-cd-autoplay \
+  providers/audio-cd/bin/roaring-cd-player \
+  providers/audio-cd/bin/roaring-cd-session \
+  providers/audio-cd/bin/cd_paths.py \
+  providers/minecraft/bin/roaring-minecraft-presence \
+  tools/assets/bin/roaring-presence-art.py \
+  tools/assets/bin/roaring-presence-assets
+bash -n install.sh
 ```
 
-- **Nothing in Discord**: check the manager is connected — the socket path is
-  probed from `ipc_socket_candidates` (Vesktop's flatpak path first).
-- **No cover art**: some releases simply have none in the Cover Art Archive;
-  `cover art lookup skipped: 404` is that, not a bug.
-- **No per-track titles**: the disc had no CD-Text and the MusicBrainz detail
-  fetch timed out. Album, artist, and cover still work; the background retry
-  has another go at 20s, 45s, and 120s.
-- **Album and artist show as `?`**: neither the kernel CD-Text read nor the
-  MusicBrainz disc ID found anything, which is expected for a disc that is
-  pressed without CD-Text and not yet in MusicBrainz. Check the reader itself
-  with `roaring-cd-presence /dev/sr1 --once --dry-run -v` and look for the
-  `CD-Text:` line.
-- **Repeated `503` from MusicBrainz**: you are being rate-limited. The client
-  already paces itself; if you lowered `poll_seconds` a long way, raise it.
-- **Manager exits on its own**: that's on purpose, after `idle_exit_seconds`
-  with no providers connected. The socket starts it again when needed.
-- **Drive spins up on its own after insert**: that's the preload. Set
-  `"preload": false` under `cd` to turn it off.
-- **Track names look wrong**: the grey name in parentheses is the other
-  source's guess (usually MusicBrainz vs CD-Text). `roaring-cd-presence
-  /dev/sr1 --once --dry-run -v` shows both.
+The tests are hardware-independent: they use synthetic Discord payloads,
+temporary image files, temporary log directories, and a disposable child
+process for the pidfd lifecycle test. They do not need a CD in the drive,
+a running Minecraft game, or a live Discord session. GitHub Actions runs the
+same checks on pushes and pull requests.
+
+## Updating and troubleshooting
+
+A Git checkout install creates `roaring-presence-update`. It checks the
+configured GitHub branch, refuses to overwrite local edits or a diverged
+checkout, tests the candidate commit in a temporary worktree, then reinstalls
+the selected profile and refreshes active provider processes. Use:
+
+```bash
+~/.local/bin/roaring-presence-update --check
+~/.local/bin/roaring-presence-update
+```
+
+Start diagnostics for the feature you use:
+
+```bash
+~/.local/bin/roaring-presence-doctor --component cd-player
+~/.local/bin/roaring-presence-doctor --component audio-cd
+journalctl --user -u roaring-presenced -f
+journalctl --user -u 'roaring-cd-presence@*' -f
+```
+
+Useful CD diagnostics:
+
+```bash
+~/.local/bin/roaring-cd-presence /dev/sr1 --once --dry-run -v
+journalctl --user -u 'roaring-cd-presence@*' -f
+tail -f "${XDG_CACHE_HOME:-$HOME/.cache}/roaring-presence/autoplay.log"
+```
+
+Useful Minecraft diagnostics:
+
+```bash
+~/.local/bin/roaring-minecraft-presence --demo --once --dry-run
+journalctl --user -u roaring-minecraft-presence -f
+```
+
+If the Discord socket is missing, start your desktop Discord client and run
+`roaring-presence-doctor`. The manager checks the standard XDG/temp paths and
+common sandbox locations. Add a custom path to `ipc_socket_candidates` only if
+your client uses a nonstandard socket. See the compatibility guide if no
+socket is found. If no activity appears, check the
+manager endpoint with `roaring-presence-doctor`, optionally query it with
+`roaring-presence-doctor --query-manager`, and verify your Application ID.
+For CD images, confirm the asset key in the Developer Portal exactly matches
+the key in config. Dynamic Cover Art Archive artwork is separate from your
+application's uploaded asset keys.
+
+## Legacy files
+
+`legacy/` retains the old direct-Discord Minecraft RPC client and the
+Vesktop-to-Prism `socat` bridge for reference. They are not installed by the
+current installer. The core manager now owns Discord IPC and supports multiple
+providers on one connection. After verifying that nothing else uses the old
+bridge, remove an enabled copy with:
+
+```bash
+./install.sh --remove-legacy-bridge
+```
+
+See [architecture and lifecycle notes](docs/architecture.md) for the design.
+
+
+## Project information
+
+- [MIT License](LICENSE)
+- [Changelog](CHANGELOG.md)
+- [Support and supported scope](SUPPORT.md)
+- [Maintainer release procedure](docs/releasing.md)
+- [Third-party notices](THIRD_PARTY_NOTICES.md)
+- [Security policy](SECURITY.md)
+- [Contributing](CONTRIBUTING.md)
+
+The MIT License covers original project code and documentation in this
+repository. External system packages and compatible desktop clients retain
+their own licenses and terms; see [third-party notices](THIRD_PARTY_NOTICES.md).

@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""Prepare arbitrary local images as a named Discord Rich Presence asset pack.
+
+This command is offline and one-shot. It never contacts Discord or reads
+credentials. Upload the prepared PNGs in the application's Developer Portal.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import tempfile
+import unicodedata
+from pathlib import Path
+
+try:
+    from PIL import Image, ImageOps
+except ImportError:
+    print(
+        "Pillow is required. On Fedora/Nobara: sudo dnf install python3-pillow",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+DEFAULT_SIZE = 1024
+MAX_SIZE = 4096
+RESAMPLE = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+
+
+def asset_key(value: str) -> str:
+    """Make a stable lowercase ASCII key from a label or filename."""
+    normalized = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode()
+    key = re.sub(r"[^a-zA-Z0-9_-]+", "-", normalized.strip().lower())
+    key = re.sub(r"-{2,}", "-", key).strip("-_")
+    if not key:
+        raise ValueError(f"cannot make an asset key from {value!r}")
+    if len(key) > 100:
+        raise ValueError(f"asset key is longer than 100 characters: {key!r}")
+    return key
+
+
+def parse_source(spec: str) -> tuple[str, Path]:
+    """Accept IMAGE or KEY=IMAGE; split only at the first '='."""
+    if "=" in spec:
+        raw_key, raw_path = spec.split("=", 1)
+        if not raw_key.strip() or not raw_path.strip():
+            raise ValueError(f"expected KEY=IMAGE, got {spec!r}")
+        return asset_key(raw_key), Path(raw_path).expanduser()
+    source = Path(spec).expanduser()
+    return asset_key(source.stem), source
+
+
+def parse_background(value: str) -> tuple[int, int, int, int]:
+    if value == "transparent":
+        return (0, 0, 0, 0)
+    raw = value.lstrip("#")
+    if len(raw) not in (6, 8) or not re.fullmatch(r"[0-9a-fA-F]+", raw):
+        raise ValueError("background must be 'transparent', #RRGGBB, or #RRGGBBAA")
+    channels = tuple(int(raw[index:index + 2], 16) for index in range(0, len(raw), 2))
+    return channels + ((255,) if len(channels) == 3 else ())
+
+
+def prepare_image(
+    source: Path,
+    destination: Path,
+    size: int,
+    fit: str,
+    background: tuple[int, int, int, int],
+) -> tuple[int, int]:
+    with Image.open(source) as opened:
+        image = ImageOps.exif_transpose(opened).convert("RGBA")
+        if fit == "cover":
+            result = ImageOps.fit(image, (size, size), method=RESAMPLE, centering=(0.5, 0.5))
+        else:
+            contained = ImageOps.contain(image, (size, size), method=RESAMPLE)
+            result = Image.new("RGBA", (size, size), background)
+            result.alpha_composite(
+                contained,
+                ((size - contained.width) // 2, (size - contained.height) // 2),
+            )
+        result.save(destination, format="PNG", optimize=True)
+    return size, size
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Prepare arbitrary images as square, upload-ready Rich Presence PNG assets."
+    )
+    parser.add_argument(
+        "images", nargs="+", metavar="[KEY=]IMAGE",
+        help="image path; optionally assign an asset key with KEY=IMAGE",
+    )
+    parser.add_argument("-o", "--output-dir", type=Path, default=Path("presence-assets"))
+    parser.add_argument("--size", type=int, default=DEFAULT_SIZE, help="square edge, 1–4096 (default: 1024)")
+    parser.add_argument("--fit", choices=("contain", "cover"), default="contain")
+    parser.add_argument("--background", default="transparent", help="contain canvas: transparent or #RRGGBB[AA]")
+    parser.add_argument("--overwrite", action="store_true", help="replace existing pack files")
+    args = parser.parse_args(argv)
+
+    if not 1 <= args.size <= MAX_SIZE:
+        parser.error(f"--size must be between 1 and {MAX_SIZE}")
+    try:
+        background = parse_background(args.background)
+        parsed = [parse_source(spec) for spec in args.images]
+        seen: set[str] = set()
+        for key, source in parsed:
+            if key in seen:
+                raise ValueError(f"duplicate asset key: {key}")
+            seen.add(key)
+            if not source.is_file():
+                raise FileNotFoundError(f"image not found: {source}")
+
+        output_dir = args.output_dir.expanduser()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = output_dir / "manifest.json"
+        destinations = [output_dir / f"{key}.png" for key, _source in parsed]
+        collisions = [path for path in [*destinations, manifest_path] if path.exists()]
+        if collisions and not args.overwrite:
+            raise FileExistsError(
+                "output already exists; pass --overwrite to replace: "
+                + ", ".join(str(path.name) for path in collisions)
+            )
+
+        entries: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory(prefix=".roaring-assets-", dir=output_dir) as staging:
+            staging_dir = Path(staging)
+            for (key, source), destination in zip(parsed, destinations):
+                staged = staging_dir / destination.name
+                width, height = prepare_image(
+                    source, staged, args.size, args.fit, background
+                )
+                entries.append({
+                    "key": key,
+                    "file": destination.name,
+                    "width": width,
+                    "height": height,
+                })
+
+            manifest = {
+                "format_version": 1,
+                "image_size": [args.size, args.size],
+                "fit": args.fit,
+                "assets": entries,
+                "instructions": [
+                    "Open your Discord application's Rich Presence > Art Assets page.",
+                    "Upload each PNG and use its 'key' as the asset name.",
+                    "Use the exact key in your presence activity's large_image or small_image field.",
+                ],
+            }
+            staged_manifest = staging_dir / "manifest.json"
+            staged_manifest.write_text(
+                json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+            )
+
+            # All images and the manifest are prepared before any final path changes.
+            for destination in destinations:
+                os.replace(staging_dir / destination.name, destination)
+            os.replace(staged_manifest, manifest_path)
+
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    for entry in entries:
+        print(f"{entry['key']:<28} {entry['file']}  {entry['width']}x{entry['height']}")
+    print(f"manifest: {manifest_path}")
+    print(f"prepared {len(entries)} asset(s) in {output_dir}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

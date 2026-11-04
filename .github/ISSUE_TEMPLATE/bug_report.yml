@@ -1,0 +1,84 @@
+name: Bug report
+description: Report a reproducible problem with installation, CD playback, or Discord presence.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please remove usernames, private paths, Discord identifiers, and unrelated personal information from logs before submitting. Never attach credentials or a complete private config file.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      options:
+        - Standalone CD player (cd-player)
+        - Discord-enabled CD (audio-cd / discord-cd)
+        - Discord core / IPC
+        - Minecraft provider
+        - Artwork tools
+        - Installer / updater
+        - Documentation
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: profile
+    attributes:
+      label: Installed profile
+      placeholder: "cd-player, audio-cd, core, minecraft, assets, all"
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Linux distribution and version
+      placeholder: "Nobara 42, Ubuntu 24.04, Fedora 43, Arch (rolling)"
+    validations:
+      required: true
+  - type: input
+    id: desktop
+    attributes:
+      label: Desktop and session
+      placeholder: "KDE Plasma 6 / Wayland, GNOME / Wayland, XFCE / X11"
+  - type: input
+    id: versions
+    attributes:
+      label: Relevant software versions
+      description: Include Python, mpv, systemd, and Discord-client versions where relevant.
+  - type: input
+    id: drive
+    attributes:
+      label: Optical drive model (CD issues)
+      placeholder: "Manufacturer and model; write N/A when unrelated"
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Relevant doctor output
+      description: Run the relevant component-scoped doctor and paste its sanitized output.
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant sanitized logs
+      description: A short journal excerpt is more useful than a full log archive.
+      render: text

@@ -1,0 +1,11 @@
+# Optional: fully automatic, zero-click audio-CD presence.
+# Install from the repository root (requires root once):
+#   sudo install -m 644 providers/audio-cd/udev/99-roaring-presence-cd.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload
+# Without this rule, a KDE Device Notifier action or an explicit command can
+# start the same per-disc provider without installing a system-wide rule.
+#
+# Only an optical drive reporting audio tracks activates the per-drive user
+# service. The provider exits after ejection; no global polling service runs.
+
+ACTION=="change", KERNEL=="sr[0-9]*", ENV{ID_CDROM_MEDIA_TRACK_COUNT_AUDIO}=="?*", ENV{SYSTEMD_USER_WANTS}+="roaring-cd-presence@%k.service"

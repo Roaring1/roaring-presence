@@ -1,0 +1,17 @@
+[Unit]
+Description=Discord RPC bridge for Vesktop flatpak → Prism Launcher
+After=graphical-session.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/mkdir -p /run/user/%U/app/com.discordapp.Discord
+ExecStartPre=/usr/bin/rm -f /run/user/%U/app/com.discordapp.Discord/discord-ipc-0
+ExecStart=/usr/bin/socat \
+  UNIX-LISTEN:/run/user/%U/app/com.discordapp.Discord/discord-ipc-0,fork \
+  UNIX-CONNECT:/run/user/%U/.flatpak/dev.vencord.Vesktop/xdg-run/discord-ipc-0
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
