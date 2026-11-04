@@ -1,6 +1,11 @@
 # Hardware validation
 
-## Audio-CD to Discord Rich Presence — 2026-10-30
+> Historical record: the test below predates the single-owner CD-session
+> simplification. Its disc, metadata and Discord observations remain useful,
+> but its autoplay-helper and separate-player lifecycle no longer describe the
+> current implementation. Re-run the real-drive checks below before release.
+
+## Audio-CD to Discord Rich Presence — 2026-10-30 (historical)
 
 A real optical-drive integration test was completed on the desktop after the
 modular deployment.
@@ -17,7 +22,7 @@ modular deployment.
 
 1. Inserting the disc started `roaring-cd-presence@sr0.service`.
 2. The provider read the kernel table of contents and detected all 11 tracks.
-3. The autoplay/player UI opened immediately.
+3. The player UI opened immediately through the then-current launch helper.
 4. The provider connected to the local `roaring-presenced` socket.
 5. Discord displayed the CD activity with artist/album/track information and
    playback timing, alongside the existing Essential Mod / Minecraft status.
@@ -53,12 +58,11 @@ entry. Plasma's task-manager tooltip volume controls are enabled by default.
 The original mpv native PipeWire stream identified itself only as `mpv`, so
 Plasma could not associate it with the visible Audio CD task.
 
-The new autoplay command selects mpv's PulseAudio compatibility output and
-sets `--audio-client-name=Audio CD`. A silent, zero-volume test stream
+The earlier mpv launch path selected mpv's PulseAudio compatibility output and
+set `--audio-client-name=Audio CD`. A silent, zero-volume test stream
 confirmed PipeWire then publishes `application.name=Audio CD`, the fallback
 identity Plasma's task manager uses to associate an application audio stream
-with its task. The current already-running mpv process keeps its old identity
-until the player is relaunched with the new options.
+with its task. An already-running mpv process kept its old identity until it was relaunched with those options.
 
 **Relevant runtime observations**
 
@@ -82,3 +86,18 @@ remain separate tests.
 The legacy Vesktop-to-Prism IPC bridge was left enabled during validation. It
 preserves the pre-existing Minecraft/Essential Mod integration and was not
 disabled.
+
+## Current lifecycle validation checklist
+
+The simplified implementation still needs a real inserted-disc run confirming:
+
+- the single per-drive user unit opens one player window;
+- Play starts mpv; pause clears Discord; resume restores it;
+- the visible next-track button advances the CD and updates Discord;
+- KDE taskbar Next/Previous/PlayPause reach the in-process MPRIS interface;
+- closing the window stops mpv and ends the per-disc service;
+- eject stops playback, clears Discord, and releases the MPRIS name;
+- no transient `roaring-cd-autoplay-*.scope` units or detached eject processes
+  are created.
+
+Hardware-dependent checks should be recorded separately from CI results.

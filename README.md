@@ -10,11 +10,10 @@ daemon:
 
 ## Quick start
 
-On Fedora/Nobara, install the base audio-CD dependencies first. Add
-`python3-pyqt6` for the full graphical player window and MPRIS controls:
+On Fedora/Nobara, install the audio-CD player dependencies:
 
 ```bash
-sudo dnf install mpv python3-psutil python3-pyqt6
+sudo dnf install mpv python3-pyqt6
 
 git clone https://github.com/Roaring1/roaring-presence.git
 cd roaring-presence
@@ -24,7 +23,7 @@ cd roaring-presence
 With a disc inserted, start it manually (replace `sr0` with your drive):
 
 ```bash
-~/.local/bin/roaring-cd-session /dev/sr0
+~/.local/bin/roaring-cd-presence --player-only /dev/sr0
 ```
 
 For automatic start on disc insertion, install the optional udev rule printed
@@ -39,7 +38,7 @@ same feature; Discord publishing is just an additional component.
 
 | Component | Job | When it runs |
 | --- | --- | --- |
-| **CD player** | Disc detection, metadata, playback controls, MPRIS/media keys and eject cleanup | Started by an optical-disc event or explicit command; lives for that disc session |
+| **CD player** | Disc detection, metadata, visible transport controls, MPRIS taskbar controls, and eject cleanup | Started by an optical-disc event or explicit command; lives for that disc session |
 | **Discord CD** | Publishes the same CD session as Discord Rich Presence through the shared core | Optional companion to the CD player; no duplicate player process |
 | **Core** | One Discord IPC connection and provider-priority arbitration | Socket-activated; exits shortly after its last provider leaves |
 | **Minecraft** | Detect a game session and publish instance/server/world details | Optional launcher-triggered provider; watches that one process |
@@ -150,8 +149,8 @@ for native, Flatpak, Vesktop, Snap, and troubleshooting notes.
 The systemd socket can remain enabled. That is not the same as keeping a
 polling daemon resident: systemd holds the listening socket and starts the
 manager when a provider connects. The manager exits after the final provider
-disconnects (one second by default), clearing activity and closing its Discord
-connection first.
+disconnects, normally within one second, clearing activity and closing its
+Discord connection first.
 
 See [core documentation](core/README.md) and
 [the provider protocol](docs/architecture.md).
@@ -168,10 +167,15 @@ optional Rich Presence publisher. It handles audio CDs from insertion to eject:
   track titles from MusicBrainz;
 - fetches front artwork from the Cover Art Archive when enabled;
 - caches resolved metadata and artwork locally per disc;
-- follows playback, publishes the active track and progress, and clears
-  activity/stops playback on eject;
-- provides the optional PyQt6 player window, MPRIS2 controls, media keys,
-  autoplay choice, and paused preload.
+- starts one player window; that process owns its mpv child and MPRIS session;
+- provides play/pause, a visible next-track button, and previous-track control;
+- exposes KDE taskbar/media controls through the player's in-process MPRIS2
+  interface;
+- publishes Discord activity only while mpv confirms active playback, and
+  clears it on pause, stop, player close, or eject.
+
+The visible next-track button is the intended way to skip. KDE taskbar media
+controls use MPRIS; the project does not install a global keyboard listener.
 
 MusicBrainz metadata lookup and Cover Art Archive art lookup are separate
 settings. Turning off `use_cover_art_archive` does not turn off MusicBrainz
@@ -191,8 +195,8 @@ the installer. Without it, start the provider from your desktop's device
 action or run:
 
 ```bash
-~/.local/bin/roaring-cd-session /dev/sr1   # no Discord dependency
-~/.local/bin/roaring-cd-presence /dev/sr1  # publishes to Discord
+~/.local/bin/roaring-cd-presence --player-only /dev/sr1  # standalone
+~/.local/bin/roaring-cd-presence /dev/sr1                # with Discord
 ```
 
 See [audio-CD documentation](providers/audio-cd/README.md).
@@ -302,9 +306,7 @@ The project targets Linux desktops with user systemd and Unix sockets.
 | --- | --- | --- |
 | Core | Python 3.10+; a compatible Discord desktop client exposing local RPC/IPC; Linux user systemd | Known native, Flatpak, and Snap socket paths are auto-discovered; custom paths can be added |
 | Audio-CD detection | Linux optical drive and kernel CD-ROM ioctls | `cd-info` fallback |
-| CD playback | `mpv` with CDDA support | Other desktop CD players can be used outside the built-in UI |
-| CD session tracking | `psutil` for active-player discovery, track and progress tracking | Required for reliable session state and autoplay avoidance |
-| CD player window | PyQt6, QtDBus and a graphical session | kdialog/zenity prompt and command-line playback |
+| CD player and playback | `mpv` with CDDA, `eject`, PyQt6, QtDBus, and a graphical session | PulseAudio compatibility output improves KDE app-volume identity when available |
 | CD metadata | Network access for MusicBrainz/CAA | Cached metadata and local CD-Text work offline |
 | Automatic disc insert | udev rule installed once as root | KDE device action or manual command |
 | Minecraft session | Java/Bedrock client | psutil is optional; Linux `/proc` fallback is built in |
@@ -322,7 +324,7 @@ core/
   systemd/user/         passive socket activation
 providers/
   audio-cd/
-    bin/                CD provider, player, autoplay, catch-up scan
+    bin/                CD session, player, catch-up scan
     systemd/user/       disc-session units
     udev/               optional insert-event rule
     desktop/            CD player desktop entry
@@ -351,10 +353,7 @@ python3 -m py_compile \
   core/bin/roaring-presenced \
   core/bin/roaring-presence-doctor \
   providers/audio-cd/bin/roaring-cd-presence \
-  providers/audio-cd/bin/roaring-cd-autoplay \
   providers/audio-cd/bin/roaring-cd-player \
-  providers/audio-cd/bin/roaring-cd-session \
-  providers/audio-cd/bin/cd_paths.py \
   providers/minecraft/bin/roaring-minecraft-presence \
   tools/assets/bin/roaring-presence-art.py \
   tools/assets/bin/roaring-presence-assets
@@ -393,7 +392,7 @@ Useful CD diagnostics:
 ```bash
 ~/.local/bin/roaring-cd-presence /dev/sr1 --once --dry-run -v
 journalctl --user -u 'roaring-cd-presence@*' -f
-tail -f "${XDG_CACHE_HOME:-$HOME/.cache}/roaring-presence/autoplay.log"
+tail -f "${XDG_CACHE_HOME:-$HOME/.cache}/roaring-presence/player.log"
 ```
 
 Useful Minecraft diagnostics:

@@ -6,8 +6,10 @@ StartLimitBurst=10
 
 [Service]
 Type=exec
-ExecStart=%h/.local/bin/roaring-cd-session /dev/%I
+ExecStart=%h/.local/bin/roaring-cd-presence --player-only /dev/%I
 Restart=on-failure
 RestartSec=10
+KillMode=control-group
+TimeoutStopSec=8s
 Slice=background.slice
 Nice=5
